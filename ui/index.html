@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Options analysis</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="chart.css">
+</head>
+<body>
+<div class="oa-wrap">
+  <div class="oa-top"><span class="oa-app" data-i18n="app_title">Options analysis</span><button type="button" class="oa-lang" id="oa-lang" hidden></button></div>
+  <form class="oa-form" id="f" novalidate>
+    <div class="fld"><span data-i18n="f_mode"></span>
+      <div class="oa-seg" role="group" id="mode">
+        <button type="button" data-m="ticker" data-i18n="mode_ticker"></button><button type="button" data-m="market" data-i18n="mode_market"></button>
+      </div></div>
+    <label><span data-i18n="f_symbol"></span><input type="text" id="symbol" name="symbol" placeholder="NVDA" maxlength="12"
+      autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus></label>
+    <label class="chk"><input type="checkbox" id="refresh"><span data-i18n="c_refresh"></span></label>
+    <button class="oa-go" id="go" data-i18n="go"></button>
+  </form>
+  <div id="msg" class="oa-msg" aria-live="polite"></div>
+  <div id="out" class="oa-msg"></div>
+</div>
+<script src="i18n.js"></script>
+<script src="chart.js"></script>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const I = OA_I18N, t = I.t;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// What people type: nvda, $NVDA, BRK.B, BRK-B, BRK/B, "brk b", SPX, ^SPX, $SPX, _SPX. scripts/symbols.py decides;
+// this only stops obvious typos before a request.
+const SYMBOL_RE = /^[$^_]?[A-Z0-9]{1,8}(?:[.\-\/ ][A-Z0-9]{1,4})?$/;
+const MODE_KEY = "oa-mode";
+let mode = "ticker", result = null, pending = null;
+try { if (localStorage.getItem(MODE_KEY) === "market") mode = "market"; } catch (e) { /* storage blocked */ }
+
+function paintMode() {
+  document.querySelectorAll("#mode button").forEach(b => {
+    b.classList.toggle("on", b.dataset.m === mode);
+    b.setAttribute("aria-pressed", String(b.dataset.m === mode));
+  });
+  $("#symbol").disabled = mode === "market";
+}
+function setMode(next) {
+  mode = next === "market" ? "market" : "ticker";
+  try { localStorage.setItem(MODE_KEY, mode); } catch (e) { /* storage blocked */ }
+  paintMode();
+}
+document.querySelectorAll("#mode button").forEach(b => b.addEventListener("click", () => setMode(b.dataset.m)));
+
+const cleanSymbol = s => String(s || "").trim().toUpperCase().replace(/\s+/g, " ").replace(/^\$ /, "$");
+
+// Draws whatever the page holds: a result, the loading state, or nothing.
+function show() {
+  if (result) {
+    $("#msg").innerHTML = "";
+    OAChart.render($("#out"), result.chart);
+  } else if (pending) {
+    const text = pending === "MARKET" ? t("loading_market") : t("loading", pending);
+    $("#msg").innerHTML = `<div class="oa-card"><span class="oa-spin"></span>${esc(text)}</div>`;
+  }
+}
+
+function fail(message) {
+  $("#msg").innerHTML = `<div class="oa-card oa-error" role="alert">${esc(message)}</div>`;
+}
+
+// A fixed sentence has an id (err_vix_futures, err_djx); its text is shown when the language has one.
+const errorText = data => data.error_id && I.has("err_" + data.error_id) ? t("err_" + data.error_id) : data.error;
+
+function setTitle() {
+  const m = result && result.chart && result.chart.meta;
+  document.title = !m ? t("app_title") : m.mode === "market" ? t("app_title_market") : `${m.ticker} · ${t("app_title")}`;
+}
+
+$("#f").addEventListener("submit", async e => {
+  e.preventDefault();
+  let url, label;
+  if (mode === "market") {
+    url = "/api/market";
+    label = "MARKET";
+  } else {
+    const sym = cleanSymbol($("#symbol").value);
+    $("#symbol").value = sym;
+    if (!SYMBOL_RE.test(sym)) { fail(t("err_symbol")); return; }
+    url = "/api/analyze?" + new URLSearchParams({ symbol: sym });
+    label = sym;
+  }
+  if ($("#refresh").checked) url += (url.includes("?") ? "&" : "?") + "refresh=1";
+  result = null; pending = label;
+  $("#out").innerHTML = "";
+  $("#go").disabled = true;
+  setTitle();
+  show();
+  try {
+    const res = await fetch(url);
+    const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    if (!res.ok || data.error) throw new Error(errorText(data) || `HTTP ${res.status}`);
+    result = data;
+    setTitle();
+    show();
+    const m = data.chart.meta;
+    history.replaceState(null, "", m.mode === "market" ? "?mode=market" : `?symbol=${encodeURIComponent(m.ticker)}`);
+  } catch (err) {
+    fail(err.message);
+  } finally {
+    pending = null;
+    $("#go").disabled = false;
+  }
+});
+
+I.bindToggle($("#oa-lang"));
+I.applyStatic(document);
+I.onChange(() => { setTitle(); show(); });
+setTitle();
+const params = new URLSearchParams(location.search);
+if (params.get("mode") === "market") setMode("market");
+else if (params.get("symbol")) setMode("ticker");
+paintMode();
+if (params.get("symbol") && mode === "ticker") $("#symbol").value = cleanSymbol(params.get("symbol"));
+if (params.get("mode") === "market" || (params.get("symbol") && mode === "ticker")) $("#f").requestSubmit();
+</script>
+</body>
+</html>
