@@ -1,0 +1,12 @@
+# Python caches and test runs
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Analysis output, packaged skills and private test data never go into the repository
+oa-output/
+dist/
+*.skill
+test-data/
+
+.DS_Store
