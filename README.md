@@ -41,7 +41,7 @@ report in the language of the request.
 cboe-options-analysis/
 ├── SKILL.md                  # Instructions for Claude: setup, workflow, interpretation rules, options
 ├── README.md                 # This file: the guide for people
-├── requirements.txt          # pandas, numpy, pyarrow (tzdata on Windows)
+├── requirements.txt          # pandas, numpy, pyarrow, truststore, certifi (tzdata on Windows)
 ├── requirements-dev.txt      # + pytest
 ├── references/
 │   ├── report_template.md    # The ticker report: sections, key paths, tables, wording, a worked example
@@ -61,6 +61,7 @@ cboe-options-analysis/
 │   ├── market.py             # The market view and the thermometer
 │   ├── history.py            # The history store: chains, summaries, IV Rank, open-interest changes
 │   ├── chart.py              # Chart data and the self-contained chart.html
+│   ├── tls.py                # HTTPS certificate checks: the OS certificate store, certifi, SSL_CERT_FILE
 │   ├── quality.py, core.py, fetch.py, config.py, winenv.py
 ├── ui/
 │   ├── server.py             # Local web server (127.0.0.1:8987)
@@ -72,7 +73,7 @@ cboe-options-analysis/
 ## Requirements
 
 - Python 3.11 or later (built and tested with Python 3.13, pandas 3.0, numpy 2.5, pyarrow 26).
-- `pip install -r requirements.txt` (pandas, numpy, pyarrow; `tzdata` is added on Windows).
+- `pip install -r requirements.txt` (pandas, numpy, pyarrow, truststore and certifi; `tzdata` is added on Windows).
 - On Windows the command is usually `python` (or `py`); on macOS and Linux `python3`.
 
 ---
@@ -90,6 +91,18 @@ python -m pip install -r requirements.txt
 CBOE needs no key. The machine must reach `cdn.cboe.com` and `cdn-api.cboe.com` (CBOE redirects every
 request to `cdn-api`), plus `financialmodelingprep.com` when FMP is used. In a sandbox or a corporate
 network with an allowlist, all three hosts must be on it.
+
+HTTPS certificates are always checked, the way a browser checks them: `truststore` hands the check to the
+operating system (on Windows it also downloads a root certificate that Windows does not have yet), and
+`certifi` adds the standard Mozilla list of root certificates. A company proxy or an antivirus product that
+inspects HTTPS usually puts its root certificate in the Windows certificate store, and then nothing else is
+needed. If it does not, save that root certificate as a PEM file and point `SSL_CERT_FILE` at it:
+
+```powershell
+setx SSL_CERT_FILE "C:\certs\company-root.pem"
+```
+
+Then open a new terminal and restart Claude (macOS / Linux: `export SSL_CERT_FILE=...` in the shell profile).
 
 ### 3. The FMP key (optional)
 
@@ -171,10 +184,10 @@ python scripts/cboe_client.py check SPY
 python scripts/fmp_client.py check
 ```
 
-The first prints the final URL after the redirect, the HTTP status, the sizes before and after gzip,
-the feed time, `Last-Modified`, the contract and expiry counts. The second (with a key) prints the FMP
-route and whether each endpoint the skill uses (profile, earnings, dividends, daily prices) is in your
-plan. Neither prints the key.
+The first prints which certificates are trusted, the final URL after the redirect, the HTTP status, the
+sizes before and after gzip, the feed time, `Last-Modified`, the contract and expiry counts. The second
+(with a key) prints the FMP route and whether each endpoint the skill uses (profile, earnings, dividends,
+daily prices) is in your plan. Neither prints the key.
 
 ### 7. Install it as a Claude skill
 
@@ -364,9 +377,10 @@ On Windows, keep pytest's temporary files out of the skill folder:
 python -m pytest -q -p no:cacheprovider --basetemp=%TEMP%\oa-pytest
 ```
 
-A few checks compare results with values measured on real CBOE and FMP files from 2026-11-05. Those files
-are private test data and are not part of this repository or the packaged skill; point `OA_TEST_DATA` at
-that folder to run the checks, otherwise they are skipped.
+The HTTPS tests run a local server with test certificates made by the `openssl` command, and are skipped
+where that command is missing. A few checks compare results with values measured on real CBOE and FMP files
+from 2026-11-05. Those files are private test data and are not part of this repository or the packaged skill;
+point `OA_TEST_DATA` at that folder to run the checks, otherwise they are skipped.
 
 ---
 
@@ -376,11 +390,12 @@ that folder to run the checks, otherwise they are skipped.
 |---|---|
 | `No option chain on CBOE: XYZ` | CBOE has no options for that symbol (HTTP 403 `AccessDenied`). Check the ticker; indices are found with or without `^`, `$` or `_` |
 | `CBOE error: cannot reach cdn.cboe.com` or timeouts | A network block. Allow `cdn.cboe.com` and `cdn-api.cboe.com`, then run `python scripts/cboe_client.py check SPY` |
+| `TLS certificate verification failed for cdn.cboe.com` | Run `python -m pip install -r requirements.txt` (truststore, certifi), copy the skill folder again, then `python scripts/cboe_client.py check SPY`. The message gives the reason, who issued the certificate your network presented, and what was trusted. Issued by a public authority such as Let's Encrypt: check the computer's date and time. Issued by your company, a proxy, an antivirus or a VPN app: it inspects HTTPS; set `SSL_CERT_FILE` to its root certificate (section 1, step 2) or exclude `cdn.cboe.com` and `cdn-api.cboe.com` from HTTPS scanning. Never turn verification off |
 | `VIX options settle to VIX futures ...` | Expected: use `python scripts/analyze.py --market` for VIX |
 | `FMP not configured` in the report | No `FMP_API_KEY`: earnings, realized volatility, dividends and the cone are unavailable; everything else works |
 | `FMP key rejected` / `FMP unreachable` | Wrong key, or the FMP host is blocked. Run `python scripts/fmp_client.py check` |
 | `HTTPS certificate verification failed for 54.236.92.205` | `FMP_BASE_URL` still points to the old proxy. Remove it and restart Claude and `ui/server.py` |
-| `certificate verify failed` with the official FMP API | Something on the network intercepts HTTPS. Do not turn verification off. On a Mac with python.org Python, run `Install Certificates.command` once |
+| `HTTPS certificate verification failed for financialmodelingprep.com` | As for `cdn.cboe.com` above. Do not turn verification off |
 | IV Rank says "history n days, need 60" | Not enough stored days yet. Schedule `snapshot.py` (section 3); until then the report uses a CBOE volatility index where one exists |
 | "intraday data: the session has not closed" | Run during market hours: values change, nothing is saved. Run after 16:15 New York for closing data |
 | "option quotes are from the overnight (GTH) session" | SPX, XSP and VIX after 20:15 New York: option quotes are overnight quotes while the index is the 16:00 close. Expected; nothing is saved |

@@ -14,8 +14,9 @@ option prices. The output describes the options market. It is not advice.
 
 ## Setup (once)
 
-1. `pip install -r requirements.txt` (pandas, numpy and pyarrow; Python 3.11+, built with Python 3.13, pandas 3.0,
-   numpy 2.5 and pyarrow 26). Windows also gets `tzdata`.
+1. `pip install -r requirements.txt` (pandas, numpy, pyarrow, truststore and certifi; Python 3.11+, built with
+   Python 3.13, pandas 3.0, numpy 2.5 and pyarrow 26). Windows also gets `tzdata`. truststore lets the operating
+   system check HTTPS certificates, and certifi adds the standard root list (see Troubleshooting).
 2. **CBOE needs no key.** The machine must reach `cdn.cboe.com` and `cdn-api.cboe.com` (CBOE answers every request
    with a 307 redirect to `cdn-api`). Add `financialmodelingprep.com` when FMP is used. In a sandbox with a network
    allowlist, all three hosts must be on it.
@@ -191,8 +192,14 @@ All analysis thresholds live in `scripts/config.py`, and each run records them i
 - `python scripts/cboe_client.py clear-cache` deletes cached chains and index files.
 - `python scripts/fmp_client.py check [SYMBOL]` shows the FMP route and which endpoints work on the plan;
   `python scripts/fmp_client.py clear-cache` clears the FMP cache and the saved proxy detection.
-- "certificate verify failed" on the official FMP API: something on the network is intercepting HTTPS. Do not turn
-  verification off. With a third-party proxy, see Setup 4.
+- `TLS certificate verification failed for cdn.cboe.com` (or `HTTPS certificate verification failed for
+  financialmodelingprep.com`): the message gives the reason, who issued the certificate the network presented and
+  what was trusted. If it says truststore or certifi is not installed, ask the user to run
+  `python -m pip install -r requirements.txt` with the same Python and to copy the skill folder again. If the
+  issuer is not a public authority (a company proxy, an antivirus or a VPN app), something inspects HTTPS: the user
+  can save its root certificate as a PEM file and set `SSL_CERT_FILE` to it (Windows: `setx SSL_CERT_FILE "<path>"`,
+  then a new terminal and a restart of Claude). Never turn certificate verification off. With a third-party FMP
+  proxy, see Setup 4.
 - `python -m pytest -q -p no:cacheprovider` runs the offline tests (no network, no key) on synthetic chains.
 
 ## References

@@ -1,4 +1,6 @@
 pandas>=2.2
 numpy>=1.26
 pyarrow>=14
+truststore>=0.10
+certifi
 tzdata; sys_platform == "win32"
