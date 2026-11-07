@@ -258,8 +258,9 @@ def _today_ny(now) -> dt.date:
     return CH.to_ny(now).date()
 
 
-def _massive_skipped(data: dict, ms, european: bool) -> dict:
-    """meta.skipped entries for the Massive pieces a configured Massive did not deliver."""
+def _massive_skipped(data: dict, ms, discounted: bool) -> dict:
+    """meta.skipped entries for the Massive pieces a configured Massive did not deliver (`discounted`: European
+    straddles in this run, of the ticker or of the market context's SPX)."""
     if not ms.configured:
         return {}
     out = {}
@@ -267,7 +268,7 @@ def _massive_skipped(data: dict, ms, european: bool) -> dict:
         for name in ("short_interest", "short_volume", "news") + (("float",) if data["sym"]["kind"] == "stock" else ()):
             if data.get(name) is None and data.get(f"{name}_reason"):
                 out[name] = data[f"{name}_reason"]
-    if data.get("rates") is None and european and data.get("rates_reason"):
+    if data.get("rates") is None and discounted and data.get("rates_reason"):
         out["treasury_curve"] = data["rates_reason"]
     if data.get("holidays") is None and data.get("holidays_reason"):
         out["calendar_check"] = data["holidays_reason"]
@@ -393,7 +394,9 @@ def run_analysis(ticker: str, client=None, fmp=None, now=None, refresh: bool = F
         "history": hist,
     }
     snap = metrics["snapshot"]
-    snap["rates"] = fetch.rates_block(data["rates"], data["rates_reason"], european)
+    discounted = european or ctx.get("spx_ctx") is not None      # this chain, or the SPX of the market context
+    curve, why = (data["rates"], data["rates_reason"]) if discounted else (None, fetch.RATES_NOT_NEEDED)
+    snap["rates"] = fetch.rates_block(curve, why, european)
     snap["notes"], snap["note_ids"] = [], []
     for n, nid in zip(data["notes"], data["note_ids"]):
         if nid:
@@ -409,7 +412,7 @@ def run_analysis(ticker: str, client=None, fmp=None, now=None, refresh: bool = F
         skipped["daily_bars"] = data["bars_reason"]
     if kind == "stock" and data.get("earnings_reason") and not data.get("earnings_rows"):
         skipped["earnings"] = data["earnings_reason"]
-    skipped.update(_massive_skipped(data, ms, european or market_context))
+    skipped.update(_massive_skipped(data, ms, discounted))
     chart_data = None
     metrics["meta"] = _meta(cboe, fs, ms, calls0, started, errors, {k: metrics[k] for k in TICKER_MODULES},
                             [], skipped, _fetched_at(cboe, sym["cboe"]))
@@ -645,6 +648,27 @@ def _line(label: str, text: str) -> str:
     return f"  {label:<13}: {text}"
 
 
+def _massive_lines(m: dict) -> list[str]:
+    """Summary lines for the Massive blocks of a ticker run that arrived (short data, news)."""
+    lines = []
+    short = (m.get("positioning") or {}).get("short") or {}
+    si, sv = short.get("interest") or {}, short.get("volume") or {}
+    if si.get("available") and si.get("short_interest") is not None:
+        pf = f", {_pct(si['pct_float'])} of the free float" if si.get("pct_float") is not None else ""
+        lines.append(_line("short", f"{si['short_interest']:,.0f} shares{pf}, {_num(si.get('days_to_cover'), 1)} "
+                                    f"days to cover ({si.get('settlement_date')})"))
+    if sv.get("available"):
+        lines.append(_line("short volume", f"{_pct(sv.get('ratio'))} of FINRA volume on {sv.get('date')}, "
+                                           f"{sv.get('days')}-day average {_pct(sv.get('avg_ratio'))}"))
+    news = m.get("news") or {}
+    if news.get("available"):
+        c = news.get("sentiment_counts") or {}
+        lines.append(_line("news", f"{news.get('n_articles')} articles in {news.get('window_days')} days; provider "
+                                   f"labels: {c.get('positive', 0)} positive, {c.get('neutral', 0)} neutral, "
+                                   f"{c.get('negative', 0)} negative, {c.get('unlabeled', 0)} unlabeled"))
+    return lines
+
+
 def summary(metrics: dict, paths: dict) -> str:
     """Short plain-text summary of a run for the terminal (English only)."""
     m, meta = metrics, metrics["meta"]
@@ -701,6 +725,7 @@ def summary(metrics: dict, paths: dict) -> str:
         gm = m["gamma"]
         lines.append(_line("gamma", f"{gm.get('regime') or 'n/a'}, zero gamma "
                            f"{gm['zero_gamma']:.2f}" if gm.get("zero_gamma") else f"{gm.get('regime') or 'n/a'}"))
+        lines += _massive_lines(m)
     lines.append(_line("API calls", f"{meta['network_calls']} network, {meta['cache_hits']} from cache"))
     for w in m["data_quality"].get("warnings") or []:
         lines.append(_line("WARNING", w))

@@ -3,7 +3,8 @@
 Minimal client for the Massive API (formerly Polygon.io), used by the cboe-options-analysis skill for optional
 data the CBOE chain does not carry: short interest and short sale volume, free float, news with per-ticker
 sentiment, Treasury yields (the discount curve of European index options), the exchange holiday calendar, and
-dividends when FMP has none. Massive is optional: without MASSIVE_API_KEY every analysis runs as before.
+dividends when FMP gives no answer. Massive is optional: without MASSIVE_API_KEY every analysis runs as
+before.
 
 - Standard library only; works on Windows, macOS and Linux.
 - The key is read from MASSIVE_API_KEY and sent only in the Authorization header. It never appears in a URL, a
@@ -17,7 +18,10 @@ dividends when FMP has none. Massive is optional: without MASSIVE_API_KEY every 
   needed it says why it is unavailable.
 - An endpoint the plan does not include raises RestrictedEndpoint, a rejected key InvalidKey, and a host that
   sends no HTTP response twice, or fails the certificate check, Unreachable, after which every later request of
-  the run fails at once.
+  the run fails at once. Likewise, when Massive still answers HTTP 429 after one wait (another program may be using
+  the key), or SERVER_FAILURES requests in a row end on server errors, the client's later requests fail at once
+  for a while (FAIL_FAST seconds) instead of each waiting again; cached answers are still served.
+- Redirects are never followed (the key would go with them), and any 3xx answer is an error.
 
 Environment variables:
   MASSIVE_API_KEY      required to use Massive (the free plan is enough)
@@ -35,7 +39,9 @@ CLI:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
+import math
 import os
 import shutil
 import sys
@@ -69,7 +75,9 @@ TTL = {SHORT_INTEREST: 12 * HOUR, SHORT_VOLUME: 4 * HOUR, FLOAT: 7 * DAY, DIVIDE
        TREASURY: 6 * HOUR, HOLIDAYS: DAY}
 DEFAULT_TTL = HOUR
 NETWORK_ATTEMPTS = 2   # tries per request when no HTTP response arrives (timeout, refused, DNS)
-HTTP_ATTEMPTS = 3      # tries per request on HTTP 5xx
+HTTP_ATTEMPTS = 3      # tries per request on HTTP 5xx (a retry only when a request slot is free at once)
+SERVER_FAILURES = 2    # requests in a row that end on HTTP 5xx before the later ones fail at once
+FAIL_FAST = {"throttled": 60.0, "server": 300.0}   # seconds later requests fail at once after a 429 / server errors
 WINDOW = 60.0          # seconds of the rate window
 RATE_FILE = "rate-window.json"   # request times (time.time()) of the last WINDOW seconds, shared by processes
 
@@ -94,16 +102,21 @@ class RateLimited(MassiveError):
     """No free request slot within MASSIVE_MAX_WAIT seconds (or Massive answered HTTP 429)."""
 
 
+class ServerTrouble(MassiveError):
+    """Massive answered server errors to SERVER_FAILURES requests in a row: later requests are skipped for a while."""
+
+
 def default_cache_dir() -> Path:
     return Path(os.environ.get("MASSIVE_CACHE_DIR") or (Path.home() / ".cache" / C.MASSIVE_CACHE_SUBDIR))
 
 
 def _env_number(name: str, default: float) -> float:
+    """A positive, finite number from the environment, else the default (junk such as "inf" never stops a run)."""
     try:
         v = float(os.environ.get(name) or default)
     except ValueError:
         return float(default)
-    return v if v > 0 else float(default)
+    return v if math.isfinite(v) and v > 0 else float(default)
 
 
 def _is_cert_error(exc) -> bool:
@@ -126,6 +139,19 @@ def _message(body: str) -> str | None:
     return None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: urllib would send the Authorization header (the key) to the new address, whatever its
+    scheme or host. The 3xx answer reaches the client as an error status instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_opener(context):
+    """An HTTPS opener with the given verified context that does not follow redirects."""
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), _NoRedirect())
+
+
 class MassiveClient:
     def __init__(self, api_key=None, cache_dir=None, use_cache=True, refresh=False, max_per_min=None,
                  max_wait=None, timeout=None, base=OFFICIAL_BASE, urlopen=None, sleep=time.sleep,
@@ -134,6 +160,9 @@ class MassiveClient:
         if not self.api_key:
             raise InvalidKey("MASSIVE_API_KEY is not set. Set it as an environment variable "
                              "(Windows: setx MASSIVE_API_KEY \"your_key\", then open a new terminal).")
+        if not (self.api_key.isascii() and self.api_key.isprintable()):
+            raise InvalidKey("MASSIVE_API_KEY contains characters that cannot be sent (typographic quotes or invisible "
+                             "characters copied with it?): set it again with the key alone")
         self.base = base.rstrip("/")
         if not self.base.startswith("https://"):
             raise MassiveError("the Massive base URL must use https")
@@ -152,6 +181,8 @@ class MassiveClient:
         self._sent: list[float] = []         # clock() of this client's requests (when the shared file fails)
         self.stats = {"network_calls": 0, "cache_hits": 0}
         self.unreachable = None              # message once a request got no HTTP response; later requests fail fast
+        self._halt = None                    # (exception class, message, clock() until which requests fail fast)
+        self._server_failures = 0            # requests in a row that ended on HTTP 5xx
 
     # ------------------------------------------------------------------ connection
     @property
@@ -163,7 +194,7 @@ class MassiveClient:
 
     def _open(self, req, timeout=None):
         if self._opener is None:
-            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.trust.context))
+            self._opener = build_opener(self.trust.context)
         return self._opener.open(req, timeout=timeout)
 
     def describe(self) -> dict:
@@ -218,7 +249,9 @@ class MassiveClient:
                 now = self._clock()
                 times = self._read_window(now)
                 if len(times) < self.per_min:
-                    self._write_window(times + [now])
+                    # a distinct time per request: the window is merged as a set, and two requests read at the same
+                    # clock tick (a coarse clock) must still count twice
+                    self._write_window(times + [max(now, times[-1] + 1e-6) if times else now])
                     return
                 wait = WINDOW - (now - times[-self.per_min]) + 0.25
             if wait > max_wait:
@@ -257,16 +290,31 @@ class MassiveClient:
                 body = ""
             return e.code, body, e.headers
 
+    def _fail_fast(self, kind: str, exc_class, message: str) -> None:
+        """Later requests of this client fail at once with `message` for FAIL_FAST[kind] seconds."""
+        self._halt = (exc_class, message, self._clock() + FAIL_FAST[kind])
+
     def _fetch(self, path: str, params: dict, max_wait: float) -> dict:
         if self.unreachable:
             raise Unreachable(self.unreachable)
+        if self._halt is not None:
+            if self._clock() < self._halt[2]:
+                raise self._halt[0](self._halt[1])
+            self._halt = None
         url = self.base + path + (("?" + urllib.parse.urlencode(params)) if params else "")
-        no_response, last = 0, None
-        for attempt in range(HTTP_ATTEMPTS + 1):
-            self._slot(max_wait)
+        no_response, server_errors, last, retry_if_free = 0, 0, None, False
+        for attempt in range(HTTP_ATTEMPTS + 1):    # one more than HTTP_ATTEMPTS: a 429 or a lost response retries
+            if retry_if_free:                        # a server-error retry never waits for a slot later requests need
+                try:
+                    self._slot(0)
+                except RateLimited:
+                    break
+            else:
+                self._slot(max_wait)
+            retry_if_free = False
             try:
                 status, body, headers = self._request(url)
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as e:
                 if _is_cert_error(e):                # nothing on this host can work: fail the rest of the run fast
                     self.unreachable = self._cert_failure(url, e)
                     raise Unreachable(self.unreachable) from None
@@ -274,40 +322,58 @@ class MassiveClient:
                 if no_response >= NETWORK_ATTEMPTS:
                     self.unreachable = self._redact(f"cannot reach {self.host}: {getattr(e, 'reason', e)}")
                     raise Unreachable(self.unreachable) from None
-                print(f"[massive] no response from {self.host} on {path} ({getattr(e, 'reason', e)}); retrying once ...",
-                      file=sys.stderr, flush=True)
+                print(self._redact(f"[massive] no response from {self.host} on {path} ({getattr(e, 'reason', e)}); "
+                                   "retrying once ..."), file=sys.stderr, flush=True)
                 self._sleep(1)
                 continue
+            except ValueError:                       # a header http.client cannot send: only the key is variable
+                raise InvalidKey("MASSIVE_API_KEY contains characters that cannot be sent in a header") from None
             self.stats["network_calls"] += 1
             body = self._redact(body)
-            msg = _message(body)
+            msg = _plain(_message(body), 200)
             if status == 401:
                 raise InvalidKey(f"key rejected on {path}: {msg or 'HTTP 401'}")
             if status == 429:                        # another program may be using the key
-                wait = _retry_after(headers)
+                wait = _retry_after(headers, self._clock())
                 wait = WINDOW if wait is None else wait
                 if attempt == 0 and wait <= max_wait:
                     print(f"[massive] HTTP 429 on {path}: waiting {wait:.0f}s ...", file=sys.stderr, flush=True)
                     self._sleep(wait)
                     continue
-                raise RateLimited(f"Massive rate limit on {path} (HTTP 429): run again in a minute")
+                text = f"Massive rate limit on {path} (HTTP 429): run again in a minute"
+                self._fail_fast("throttled", RateLimited, text)
+                raise RateLimited(text)
             if status in (402, 403):
-                detail = (msg or f"HTTP {status}").strip().replace("\n", " ")[:160]
+                detail = (msg or f"HTTP {status}")[:160]
                 raise RestrictedEndpoint(f"{path}: not included in your plan ({detail})")
             if status >= 500:
                 last = MassiveError(f"HTTP {status} on {path} (server error)")
-                self._sleep(2 ** attempt)
+                server_errors += 1
+                if server_errors >= HTTP_ATTEMPTS or attempt == HTTP_ATTEMPTS:   # no wait after the last try
+                    break
+                self._sleep(2 ** (server_errors - 1))
+                retry_if_free = True
                 continue
+            if 300 <= status < 400:                  # redirects are not followed: the key must not go elsewhere
+                raise MassiveError(f"HTTP {status} on {path} (redirect not followed)")
             if status >= 400:
-                raise MassiveError(f"HTTP {status} on {path}: {(msg or body)[:200]}")
+                raise MassiveError(f"HTTP {status} on {path}: {msg or _plain(body, 200) or ''}")
+            self._server_failures = 0
             try:
                 data = json.loads(body) if body.strip() else {}
             except ValueError:
                 raise MassiveError(f"{path}: response was not JSON: {body[:120]!r}") from None
             if isinstance(data, dict) and str(data.get("status", "")).upper() in ("ERROR", "NOT_AUTHORIZED"):
-                raise MassiveError(f"{path}: {msg or data.get('status')}")
+                raise MassiveError(f"{path}: {msg or _plain(str(data.get('status')), 40)}")
             return data
-        raise last or MassiveError(f"{path}: failed after retries")
+        if last is not None:                         # this request ended on server errors
+            self._server_failures += 1
+            if self._server_failures >= SERVER_FAILURES:
+                self._fail_fast("server", ServerTrouble,
+                                f"Massive answered server errors (HTTP 5xx) to {self._server_failures} requests in a "
+                                "row: its other requests are skipped for a few minutes")
+            raise last
+        raise MassiveError(f"{path}: failed after retries")
 
     # ------------------------------------------------------------------ public
     def get(self, path: str, ttl=None, wait=None, **params):
@@ -344,19 +410,30 @@ class MassiveClient:
         data = self.get(path, ttl=ttl, wait=wait, **params)
         if isinstance(data, list):
             return data
+        if data is not None and not isinstance(data, dict):
+            raise MassiveError(f"{path}: unexpected response ({type(data).__name__})")
         res = (data or {}).get("results")
         if isinstance(res, dict):
             return [res]
+        if res is not None and not isinstance(res, list):
+            raise MassiveError(f"{path}: unexpected results ({type(res).__name__})")
         return list(res or [])
 
 
-def _retry_after(headers) -> float | None:
-    """Seconds to wait from Retry-After or x-ratelimit-reset (None when neither is a number)."""
+def _retry_after(headers, now: float | None = None) -> float | None:
+    """Seconds to wait from Retry-After or x-ratelimit-reset (None when neither is a finite number). A value above
+    1e9 is a Unix time, not a number of seconds."""
     for name in ("Retry-After", "x-ratelimit-reset"):
         try:
             v = (headers or {}).get(name)
-            if v is not None:
-                return max(0.0, float(str(v).split(",")[0].strip())) + 0.5
+            if v is None:
+                continue
+            x = float(str(v).split(",")[0].strip())
+            if not math.isfinite(x):
+                continue
+            if x > 1e9:
+                x -= time.time() if now is None else now
+            return max(0.0, x) + 0.5
         except (TypeError, ValueError):
             continue
     return None
@@ -383,7 +460,7 @@ def calendar_rows(rows) -> dict:
             try:
                 t = datetime.fromisoformat(str(r["close"]).replace("Z", "+00:00")).astimezone(ny)
                 hhmm = t.strftime("%H:%M")
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, OverflowError):
                 pass
             out[d] = ("early_close", hhmm)
     return out
@@ -393,12 +470,13 @@ def compare_calendar(rows, today: date) -> dict:
     """The NYSE holiday calendar from Massive against config.MARKET_HOLIDAYS / EARLY_CLOSES, from `today` through the
     last date Massive lists: {checked_from, checked_through, n_dates, mismatches: [{date, exchange, exchange_close,
     config, config_close, name}]}; exchange and config are "closed", "early_close" or "open", the *_close fields
-    the early close time "HH:MM" (New York) or None."""
+    the early close time "HH:MM" (New York) or None. `today` itself is compared only when Massive lists it (an
+    "upcoming" list may leave out the current day)."""
     cal = calendar_rows(rows)
     names = {}
     for r in rows or []:
         if isinstance(r, dict) and str(r.get("exchange", "")).upper() == "NYSE":
-            names[str(r.get("date"))[:10]] = r.get("name")
+            names[str(r.get("date"))[:10]] = _plain(r.get("name"))
     upcoming = sorted(d for d in cal if d >= today)
     if not upcoming:
         return {"checked_from": today, "checked_through": None, "n_dates": 0, "mismatches": []}
@@ -407,12 +485,22 @@ def compare_calendar(rows, today: date) -> dict:
     mine.update({d: ("early_close", t.strftime("%H:%M")) for d, t in C.EARLY_CLOSES.items()})
     mismatches = []
     for d in sorted(set(upcoming) | {d for d in mine if today <= d <= last}):
+        if d == today and d not in cal:
+            continue
         theirs, ours = cal.get(d, ("open", None)), mine.get(d, ("open", None))
         same_time = theirs[1] == ours[1] or theirs[1] is None     # an unreadable close time is not a mismatch
         if theirs[0] != ours[0] or not same_time:
             mismatches.append({"date": d, "exchange": theirs[0], "exchange_close": theirs[1], "config": ours[0],
                                "config_close": ours[1], "name": names.get(d.isoformat())})
     return {"checked_from": today, "checked_through": last, "n_dates": len(upcoming), "mismatches": mismatches}
+
+
+def _plain(v, limit: int = 80) -> str | None:
+    """A holiday name from Massive for metrics.json and the terminal: printable characters only, whitespace collapsed,
+    at most `limit` characters."""
+    if not isinstance(v, str):
+        return None
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in v).split())[:limit] or None
 
 
 def calendar_label(kind: str, close: str | None) -> str:

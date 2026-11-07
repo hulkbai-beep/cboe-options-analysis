@@ -474,7 +474,9 @@ def _short_interest_block(rows, reason, as_of: date, fl: dict) -> dict:
         return unavailable(reason or "no short interest data")
     items = []
     for r in rows:
-        d, si = _day((r or {}).get("settlement_date")), _f((r or {}).get("short_interest"))
+        if not isinstance(r, dict):
+            continue
+        d, si = _day(r.get("settlement_date")), _f(r.get("short_interest"))
         if d is None or si is None or si < 0 or d > as_of:
             continue
         adv = _f(r.get("avg_daily_volume"))
@@ -504,7 +506,9 @@ def _short_volume_block(rows, reason, as_of: date) -> dict:
         return unavailable(reason or "no short sale volume data")
     items = []
     for r in rows:
-        d, sv, tv = _day((r or {}).get("date")), _f((r or {}).get("short_volume")), _f((r or {}).get("total_volume"))
+        if not isinstance(r, dict):
+            continue
+        d, sv, tv = _day(r.get("date")), _f(r.get("short_volume")), _f(r.get("total_volume"))
         if d is None or sv is None or not tv or tv <= 0 or sv < 0 or d > as_of:
             continue
         items.append({"date": d, "short_volume": int(round(sv)), "total_volume": int(round(tv)), "ratio": sv / tv})
@@ -559,16 +563,17 @@ def safe_url(v) -> str | None:
 def _published(v) -> str | None:
     try:
         t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-    except ValueError:
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError):                  # OverflowError: a year-9999 time moved to UTC
         return None
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def build_news(ctx: dict) -> dict:
     """news: the latest headlines about the ticker with the provider's sentiment label for it (Massive; stocks and
-    ETFs; optional). Text is third-party data, cleaned and cut to NEWS_TEXT_CHARS."""
+    ETFs; optional). The NEWS_ROWS rows prefer articles tagged with at most NEWS_FOCUS_MAX_TICKERS tickers; the counts
+    cover every article. Text is third-party data, cleaned and cut to NEWS_TEXT_CHARS."""
     key = ctx["key"].upper()
     if ctx["kind"] == "index":
         return unavailable("news applies to stocks and ETFs", source="Massive")
@@ -582,12 +587,13 @@ def build_news(ctx: dict) -> dict:
         if not isinstance(r, dict):
             continue
         title, pub = clean_text(r.get("title")), _published(r.get("published_utc"))
-        ident = r.get("id") or (title, pub)
+        ident = r.get("id")
+        ident = ident if isinstance(ident, (str, int)) and ident else (title, pub)     # a list or dict id: unhashable
         if not title or pub is None or ident in seen:
             continue
         seen.add(ident)
-        ins = next((i for i in r.get("insights") or [] if isinstance(i, dict)
-                    and str(i.get("ticker", "")).upper() == key), None)
+        insights = r.get("insights") if isinstance(r.get("insights"), list) else []
+        ins = next((i for i in insights if isinstance(i, dict) and str(i.get("ticker", "")).upper() == key), None)
         sent = str((ins or {}).get("sentiment") or "").lower()
         sent = sent if sent in C.ENUMS["sent_"] else None
         counts[sent or "unlabeled"] += 1
@@ -597,11 +603,15 @@ def build_news(ctx: dict) -> dict:
                       "sentiment_reasoning": clean_text((ins or {}).get("sentiment_reasoning")),
                       "n_tickers": len(r.get("tickers") or []) if isinstance(r.get("tickers"), list) else None})
     items.sort(key=lambda i: i["published_utc"], reverse=True)
+    # the rows: articles about few tickers first (a roundup of many stocks says little about this one), newest first
+    few = [it["n_tickers"] is not None and it["n_tickers"] <= C.NEWS_FOCUS_MAX_TICKERS for it in items]
+    order = [i for i in range(len(items)) if few[i]] + [i for i in range(len(items)) if not few[i]]
+    shown = sorted(order[:C.NEWS_ROWS])
     out = block(source="Massive", window_from=ctx.get("news_from"), window_days=C.NEWS_LOOKBACK_DAYS,
                 n_articles=len(items), truncated=len(rows) >= C.NEWS_FETCH,
                 newest=items[0]["published_utc"] if items else None,
                 oldest=items[-1]["published_utc"] if items else None, sentiment_counts=counts,
-                rows=items[:C.NEWS_ROWS])
+                rows=[items[i] for i in shown])
     if not items:
         add_note(out, f"no articles about {ctx['key']} since {ctx.get('news_from') or 'the window start'}")
     add_note(out, nid="news_third_party")

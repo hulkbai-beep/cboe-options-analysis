@@ -17,8 +17,8 @@ Routes
 Status codes: 404 unknown symbol on CBOE, 502 CBOE unreachable or unusable, 400 invalid symbol or nothing to
 analyse (VIX in ticker mode, no live contracts), 500 anything else (redacted traceback on stderr).
 
-Connection settings come from the environment exactly as for the scripts. On Windows, FMP_* and OA_* values
-saved with `setx` are also read from the registry, so a terminal opened before `setx` still works. For the
+Connection settings come from the environment exactly as for the scripts. On Windows, FMP_*, MASSIVE_* and OA_*
+values saved with `setx` are also read from the registry, so a terminal opened before `setx` still works. For the
 third-party proxy at 54.236.92.205, FMP_TLS_VERIFY=0 is set for this process only, and only if FMP_TLS_VERIFY is
 not set already. The API key is never printed.
 """

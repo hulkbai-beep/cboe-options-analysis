@@ -62,7 +62,7 @@ screen (by expiry, then by distance to the target delta).
 | `em_units` | `otm_pct` divided by the expiry's 1σ move (`move_1sd_pct`) | "about n expected moves (1σ) away" |
 | `breakeven`, `breakeven_move_pct` | see section 5; `breakeven_move_pct` = break-even / spot − 1 | |
 | `earnings_before_expiry` | stocks: next earnings date ≤ expiry (true also when the date is today); null when the date is unknown; false for ETFs and indices | "earnings before expiry" / "unknown" / "—" |
-| `ex_div_date`, `dividend` | the first announced ex-dividend date with as_of < date ≤ expiry, and its amount per share (FMP) | |
+| `ex_div_date`, `dividend` | the first announced ex-dividend date with as_of < date ≤ expiry, and its amount per share (FMP, or Massive when FMP gives no answer: section 7) | |
 | `theta_pct_per_day` | CBOE theta (per calendar day) / mid | "the option loses about x% of its price per day if nothing else changes" |
 | `premium_per_contract` | mid × 100 | |
 | `capital` | see section 5 | "capital tied up" |
@@ -123,9 +123,17 @@ section 7.2) is at most `STRAT_EVENT_MAX_DTE` (60) days away and has an ATM stra
 ## 7. Context (`strategies.context`)
 
 `cm_iv_30d`, `hv20`, `vrp`, `iv_index_pctl`, `iv_rank`, `iv_rank_ex_event`, `term_shape`, `skew_label`,
-`next_earnings`: the readings that place the screens (IV versus realized volatility and versus its own
-history, the term structure, the skew, the next report). They describe where IV stands; they do not
-judge whether selling or buying options is a good idea.
+`next_earnings` and `dividends_source`. The first nine are the readings that place the screens (IV versus
+realized volatility and versus its own history, the term structure, the skew, the next report). They
+describe where IV stands; they do not judge whether selling or buying options is a good idea.
+
+`dividends_source` says where the ex-dividend dates and amounts came from (stocks and ETFs):
+- `fmp`: FMP's dividends endpoint answered, also when it lists no dividend before expiry;
+- `massive`: FMP gave no answer (not configured, key rejected, unreachable or outside the plan) and Massive's
+  `/stocks/v1/dividends` supplied the cash dividends in USD with an ex-date after as_of; the note "dividends
+  from Massive, not FMP ({reason})" says why;
+- null: no source answered, so the ex-dividend fields of a stock or ETF are unknown rather than absent
+  (`meta.skipped` has the reasons); always null for an index.
 
 ## 8. Notes and fixed sentences
 
@@ -134,6 +142,7 @@ judge whether selling or buying options is a good idea.
 | "after-close spreads are usually wider than intraday: table prices are not executable; check live broker quotes before trading" | the session has closed |
 | "earnings date unknown: crossing not checked" | a stock without a known next earnings date |
 | "risk-neutral arithmetic from option prices, not advice" | always |
+| "dividends from Massive, not FMP ({reason})" | `dividends_source` is `massive` |
 | "American-style: may be assigned before expiry when deep in the money" | `short_put` with American rows |
 | "before the ex-dividend date ..." | `covered_call` with an ex-dividend date before expiry |
 | "most of the straddle cost comes from non-earnings days" | `earnings_straddle` with `event_variance_share` < 0.5 |

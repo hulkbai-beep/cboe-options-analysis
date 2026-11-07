@@ -83,7 +83,7 @@ button { font: inherit; }
 .oa-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; align-items: start; }
 .oa-wide { grid-column: 1 / -1; }
 .oa-below { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 14px;
-  margin-top: 14px; align-items: start; }
+  margin-top: 14px; align-items: start; grid-auto-flow: row dense; }
 @media (max-width: 1080px) { .oa-grid { grid-template-columns: minmax(0, 1fr); } }
 .oa-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; min-width: 0; }
 .oa-card h3 { margin: 0 0 8px; font-size: 15px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
@@ -159,8 +159,9 @@ button { font: inherit; }
 .oa-kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13px; margin: 0; }
 .oa-kv dt { color: var(--muted); } .oa-kv dd { margin: 0; overflow-wrap: anywhere; }
 .oa-warn { background: var(--warn-bg); color: var(--warn-text); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; margin: 0 0 8px; }
+.oa-info { border: 1px dashed var(--border); color: var(--muted); border-radius: 8px; padding: 5px 10px; font-size: 12px; }
 .oa-notices { margin-top: 12px; }
-.oa-notices .oa-warn { margin: 0 0 6px; }
+.oa-notices .oa-warn, .oa-notices .oa-info { margin: 0 0 6px; }
 .oa-notes h4 { font-size: 12.5px; margin: 10px 0 0; color: var(--muted); font-weight: 650; }
 .oa-notes h4:first-child { margin-top: 0; }
 .oa-disclaimer { font-size: 12px; color: var(--muted); margin: 14px 0 0; }
@@ -177,6 +178,24 @@ button { font: inherit; }
 .oa-dot.on { background: var(--flag-on); } .oa-dot.na { background: transparent; border: 1px dashed var(--faint); }
 .oa-sparks { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
 .oa-spark .k { font-size: 12px; color: var(--muted); }
+.oa-spark svg { display: block; }
+
+/* short interest and news (Massive): headlines are third-party text, so long words must wrap */
+.oa-short-sparks { margin: 10px 0 2px; }
+.oa-nw { white-space: nowrap; }
+.oa-short-hist .oa-tablewrap + .oa-tablewrap { margin-top: 8px; }
+.oa-short-hist .oa-table th { white-space: normal; vertical-align: bottom; }
+.oa-news { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; }
+.oa-news li { padding: 7px 0; border-top: 1px solid var(--grid); overflow-wrap: anywhere; min-width: 0; }
+.oa-news .hl { font-weight: 600; line-height: 1.4; }
+.oa-news a { color: var(--text); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 2px; }
+.oa-news a:hover { text-decoration-color: currentColor; }
+.oa-news a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.oa-news .why { font-size: 12px; color: var(--muted); margin-top: 1px; }
+.oa-sent { display: inline-block; border: 1px solid currentColor; border-radius: 999px; padding: 0 7px; margin-right: 6px;
+  font-size: 11px; font-weight: 600; line-height: 16px; vertical-align: 1px; white-space: nowrap; }
+.oa-sent.positive { color: var(--up); } .oa-sent.negative { color: var(--down); } .oa-sent.neutral { color: var(--muted); }
+.oa-sent.none { color: var(--faint); border-style: dashed; font-weight: 500; }
 
 /* local app (ui/index.html) */
 .oa-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; background: var(--card);

@@ -99,6 +99,14 @@ def test_fixed_sentences_come_from_python_in_english():
     assert 'has("err_" + ' in INDEX
 
 
+def test_third_party_links():
+    # news titles are the only links: chart.js accepts http(s) again (after scripts/chart.py) and opens a new tab
+    # without opener or referrer; the title itself goes through esc() like every string
+    assert re.search(r"const httpUrl = u => [^\n]*\^https\?:", CHART_JS) and "const href = httpUrl(r.url)" in CHART_JS
+    assert CHART_JS.count("<a href=") == 1
+    assert '<a href="${esc(href)}" target="_blank" rel="noopener noreferrer nofollow">${esc(r.title)}</a>' in CHART_JS
+
+
 def test_one_language_hides_the_switch():
     assert re.findall(r"^    (\w+): \{", I18N, re.M) == ["en"]
     assert "if (LANGS.length < 2) { button.hidden = true; return; }" in I18N

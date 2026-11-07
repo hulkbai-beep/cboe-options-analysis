@@ -7,6 +7,7 @@ import math
 import pytest
 
 import analyze
+import fetch
 from conftest import NOW
 from fakes import FakeCboe, FakeFMP
 
@@ -20,15 +21,19 @@ def golden(real_data):
 
 @pytest.fixture(scope="module")
 def runs(real_data, tmp_path_factory):
+    """The golden values were computed without Massive (the fixed 4% discount rate): every run is told so."""
     out = {}
     for t in TICKERS:
         d = tmp_path_factory.mktemp(f"hist_{t}")
-        out[t], _ = analyze.run_analysis(t, client=FakeCboe(real_data), fmp=FakeFMP(real_data), now=NOW, data_dir=d)
+        out[t], _ = analyze.run_analysis(t, client=FakeCboe(real_data), fmp=FakeFMP(real_data), now=NOW, data_dir=d,
+                                         massive=fetch.MassiveState(None))
     d = tmp_path_factory.mktemp("hist_overnight")
     out["SPX_overnight"], _ = analyze.run_analysis("SPX", client=FakeCboe(real_data, date="2026-11-05-overnight"),
-                                                   fmp=FakeFMP(real_data), now=NOW, data_dir=d)
+                                                   fmp=FakeFMP(real_data), now=NOW, data_dir=d,
+                                                   massive=fetch.MassiveState(None))
     d = tmp_path_factory.mktemp("hist_market")
-    out["market"], _ = analyze.run_market(client=FakeCboe(real_data), fmp=FakeFMP(real_data), now=NOW, data_dir=d)
+    out["market"], _ = analyze.run_market(client=FakeCboe(real_data), fmp=FakeFMP(real_data), now=NOW, data_dir=d,
+                                          massive=fetch.MassiveState(None))
     return out
 
 

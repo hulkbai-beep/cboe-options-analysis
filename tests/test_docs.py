@@ -1,7 +1,8 @@
 """The docs describe the code as it is (plan 11, 12): SKILL.md's frontmatter and length, the options tables against
 argparse, every command line and every skill path the docs name, the folder layout of the README, the config
-constants methodology.md names, and every metrics.json key path the docs name (checked against synthetic runs,
-one of them with a seeded history store so IV Rank and the open-interest change are available)."""
+constants and environment variables the docs name, and every metrics.json key path the docs name (checked against
+synthetic runs with and without Massive, two of them with a seeded history store so IV Rank and the open-interest
+change are available)."""
 import json
 import re
 import sys
@@ -12,9 +13,14 @@ import pytest
 import analyze
 import chain as CH
 import config as C
+import fetch
 import history as H
+import massive_client as MC
 import snapshot
+import synth
+import winenv
 from conftest import NOW, SKILL, fakes_for, load_chain
+from fakes import FakeMassive
 
 sys.path.insert(0, str(SKILL / "ui"))
 import server  # noqa: E402
@@ -24,7 +30,7 @@ DOCS = ("SKILL.md", "README.md", "references/report_template.md", "references/ma
 TEXT = {name: (SKILL / name).read_text(encoding="utf-8") for name in DOCS}
 TICKER_KEYS = ("mode", "ticker", "as_of", "quote_time", "data_source", "snapshot", "data_quality", "market_context",
                "expected_move", "term_structure", "skew", "volatility", "earnings", "positioning", "gamma", "flow",
-               "strategies", "history", "meta")
+               "news", "strategies", "history", "meta")
 MARKET_KEYS = ("mode", "as_of", "quote_time", "data_source", "snapshot", "data_quality", "vix", "term_structure",
                "skew_board", "gamma_board", "expected_moves", "positioning", "realized", "thermometer", "history",
                "meta")
@@ -33,7 +39,9 @@ COMMAND = re.compile(r"\b(?:python3?|py) (scripts|ui)/(\w+\.py)\b([^`\n]*)")
 SKILL_PATH = re.compile(r"(?<![\w./~-])(?:scripts|references|ui|tests)/[\w./-]*\w")
 KEY_PATH = re.compile(r"`([a-z_0-9]+(?:\.(?:[A-Za-z0-9_]+|<[a-z_]+>)|\[\*\])+)`")
 ENV_VARS = {"OA_DATA_DIR", "OA_CACHE_DIR", "OA_TEST_DATA", "FMP_API_KEY", "FMP_BASE_URL", "FMP_TLS_VERIFY",
-            "FMP_CACHE_DIR", "FMP_MAX_PER_MIN", "FMP_TIMEOUT", "FMP_PATH_PREFIX", "FMP_AUTH_STYLE"}
+            "FMP_CACHE_DIR", "FMP_MAX_PER_MIN", "FMP_TIMEOUT", "FMP_PATH_PREFIX", "FMP_AUTH_STYLE", "MASSIVE_API_KEY",
+            "MASSIVE_MAX_PER_MIN", "MASSIVE_MAX_WAIT", "MASSIVE_TIMEOUT", "MASSIVE_CACHE_DIR", "SSL_CERT_FILE"}
+MASSIVE_VARS = {n for n in winenv.ENV_NAMES if n.startswith("MASSIVE_")}     # winenv reads them from the registry
 
 
 def without_code(text: str) -> str:
@@ -70,6 +78,7 @@ SCRIPT_OPTIONS = {
     "server.py": parser_options(server.build_parser()),
     "cboe_client.py": set(),
     "fmp_client.py": set(),
+    "massive_client.py": set(),
 }
 
 
@@ -110,7 +119,16 @@ def test_skill_options_table_matches_argparse():
     assert first_column_options(table) == SCRIPT_OPTIONS["analyze.py"]
     env = {re.sub(r"`", "", row[0]) for row in table[1:] if not row[0].startswith("`--")}
     assert {"TICKER", "OA_DATA_DIR", "OA_CACHE_DIR", "FMP_API_KEY", "FMP_BASE_URL", "FMP_TLS_VERIFY",
-            "FMP_CACHE_DIR"} <= env
+            "FMP_CACHE_DIR"} | MASSIVE_VARS <= env
+
+
+def test_massive_variables_are_documented():
+    """Every MASSIVE_* variable (the ones winenv.load_user_env reads from the registry) is named in SKILL.md and
+    README.md."""
+    assert MASSIVE_VARS == {n for n in ENV_VARS if n.startswith("MASSIVE_")}
+    for name in ("SKILL.md", "README.md"):
+        missing = sorted(n for n in MASSIVE_VARS if f"`{n}`" not in TEXT[name])
+        assert not missing, (name, missing)
 
 
 def test_readme_options_tables_match_argparse():
@@ -164,7 +182,7 @@ def numbered(text: str, level: str) -> list[str]:
     return re.findall(rf"^{level} (\d+)\. ", text, re.M)
 
 
-@pytest.mark.parametrize("name, n", [("references/report_template.md", 12), ("references/market_template.md", 9)])
+@pytest.mark.parametrize("name, n", [("references/report_template.md", 13), ("references/market_template.md", 9)])
 def test_template_sections_and_example_agree(name, n):
     text = TEXT[name]
     rules, example = text.split("## Worked example", 1)
@@ -187,13 +205,33 @@ def test_examples_have_no_verdict_words(name):
 
 
 # ---------------------------------------------------------------------------- metrics key paths
+def calendar_mismatch() -> dict:
+    """synth.massive_data() with an exchange closure that config.py does not list, so data_quality.calendar_check
+    has a mismatch whose fields the docs can name."""
+    data = synth.massive_data()
+    data[(MC.HOLIDAYS, None)] = data[(MC.HOLIDAYS, None)] + [
+        {"date": "2026-12-31", "exchange": "NYSE", "name": "Extra closure", "status": "closed"}]
+    return data
+
+
 @pytest.fixture(scope="module")
-def runs(synth_data, synth_run, tmp_path_factory):
-    """Ticker runs (ACME and SPX with a seeded history store; SPY, NDX, XSP without) and the market run."""
-    out = {"ticker": [synth_run(t)[0] for t in ("SPY", "NDX", "XSP")], "market": [synth_run("MARKET")[0]]}
-    for key in ("ACME", "SPX"):
+def runs(synth_data, tmp_path_factory):
+    """Ticker runs: SPY, NDX, XSP without Massive; ACME (FakeMassive) and SPX (FakeMassive with a calendar mismatch)
+    with a seeded history store. Market runs: without Massive, and with it (and the mismatch). Every run is given its
+    Massive state, so none builds a client from a MASSIVE_API_KEY in the environment (module fixtures are set up
+    before the function-scoped no_massive_key)."""
+    def run(key: str, massive, store=None) -> dict:
+        cboe, fmp = fakes_for(synth_data)
+        store = store or tmp_path_factory.mktemp("history")
+        if key == "MARKET":
+            return analyze.run_market(client=cboe, fmp=fmp, now=NOW, data_dir=store, massive=massive)[0]
+        return analyze.run_analysis(key, client=cboe, fmp=fmp, now=NOW, data_dir=store, massive=massive)[0]
+
+    out = {"ticker": [run(t, fetch.MassiveState(None)) for t in ("SPY", "NDX", "XSP")],
+           "market": [run("MARKET", fetch.MassiveState(None)), run("MARKET", FakeMassive(data=calendar_mismatch()))]}
+    for key, massive in (("ACME", FakeMassive()), ("SPX", FakeMassive(data=calendar_mismatch()))):
         store = tmp_path_factory.mktemp(f"seeded_{key}")
-        row = synth_run(key)[0]["history"]["summary_row"]
+        row = run(key, fetch.MassiveState(None))["history"]["summary_row"]
         days, d = [], date(2026, 11, 4)
         while len(days) < 70:
             if CH.is_trading_day(d):
@@ -211,11 +249,15 @@ def runs(synth_data, synth_run, tmp_path_factory):
         for i, o in enumerate(base["data"]["options"]):
             o["open_interest"] = max(0, (o.get("open_interest") or 0) + (300 if i % 2 else -300))
         H.save_chain(store, key, base, dict(CH.session_from_payload(base), as_of=date(2026, 11, 4)))
-        cboe, fmp = fakes_for(synth_data)
-        m = analyze.run_analysis(key, client=cboe, fmp=fmp, now=NOW, data_dir=store)[0]
+        m = run(key, massive, store)
         oc = m["positioning"]["oi_change"]
         assert m["volatility"]["iv_rank"]["available"] and oc["top_increases"] and oc["top_decreases"], key
+        assert m["snapshot"]["rates"]["source"] == "treasury" and m["data_quality"]["calendar_check"]["available"]
         out["ticker"].append(m)
+    acme, spx = out["ticker"][-2:]
+    assert acme["positioning"]["short"]["float"]["available"] and acme["news"]["rows"]
+    for m in (spx, out["market"][1]):
+        assert m["data_quality"]["calendar_check"]["mismatches"], m["mode"]
     return out
 
 
