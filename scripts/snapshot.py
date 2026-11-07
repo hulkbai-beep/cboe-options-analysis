@@ -21,9 +21,9 @@ Run it once per trading day between 16:30 and 20:00 New York time: SPX, XSP and 
 extra runs (weekends, holidays, retries) skip what is already saved. VIX is stored as a chain only (its options
 settle to VIX futures). With FMP_API_KEY set, the FMP profile decides stock or ETF and the next earnings date
 gives the ex-event 30-day IV of stocks; without it that column stays empty. With MASSIVE_API_KEY set, European
-index options (SPX, NDX, RUT, XSP) are discounted with the Treasury curve of the second trading day before the data
-date (fetch.rates_cutoff: always published by then), as in an analysis and in --rebuild-summary; without it at the
-fixed DISCOUNT_RATE.
+index options (SPX, NDX, RUT, XSP) are discounted with the Treasury curve of the second business day before the data
+date, counting days when both the NYSE and the Federal Reserve Board are open (fetch.rates_cutoff: always published
+by then), as in an analysis and in --rebuild-summary; without it at the fixed DISCOUNT_RATE.
 
 Every run is logged to <data-dir>/logs/snapshot.log as well as the console.
 Exit codes: 0 done; 1 at least one symbol failed (the others are still saved); 2 bad arguments.
@@ -57,7 +57,7 @@ class SymbolFacts:
         self.ms = ms if ms is not None else fetch.MassiveState(None)
         self._earnings: dict[str, tuple] = {}
         self._curves: dict = {}                  # as_of -> (RateCurve or None, reason)
-        self._history = None                     # (start, end, rows or None, reason) after preload_rates
+        self._history = None                     # (start, end, rows or None, {failed year: reason}) after preload_rates
         self._logged: set = set()
 
     def preload_rates(self, start, end) -> None:
@@ -66,8 +66,8 @@ class SymbolFacts:
             return
         if self._history is not None:
             start, end = min(start, self._history[0]), max(end, self._history[1])
-        rows, why = fetch.load_rate_history(self.ms, start, end)
-        self._history = (start, end, rows, why)
+        rows, failed = fetch.load_rate_history(self.ms, start, end)
+        self._history = (start, end, rows, failed)
         self._curves.clear()
 
     def rates(self, as_of):
@@ -75,10 +75,10 @@ class SymbolFacts:
         if as_of not in self._curves:
             h = self._history
             if h is not None and h[0] <= as_of <= h[1]:
-                curve, why = fetch.curve_from_rows(h[2], as_of) if h[2] is not None else (None, h[3])
-                if curve is None and h[2] is not None and h[3]:         # some years of the history failed
-                    why = f"{why} ({h[3]})"
-                self._curves[as_of] = (curve, why)
+                if h[2] is None:                                         # no year of the history could be read
+                    self._curves[as_of] = (None, "; ".join(f"{y}: {why}" for y, why in h[3].items()))
+                else:
+                    self._curves[as_of] = fetch.curve_from_rows(h[2], as_of, h[3])
             else:
                 self._curves[as_of] = fetch.load_rates(self.ms, as_of)
             curve, why = self._curves[as_of]

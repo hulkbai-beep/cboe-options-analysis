@@ -16,6 +16,7 @@ holiday calendar last and only when a request slot is free at once), because the
 """
 from __future__ import annotations
 
+import functools
 import os
 import sys
 from datetime import date, timedelta
@@ -178,21 +179,55 @@ class MassiveState:
 
 
 # ---------------------------------------------------------------------------- Treasury discount curve (Massive)
+@functools.lru_cache(maxsize=None)
+def board_holidays(year: int) -> frozenset:
+    """The days of `year` on which the Federal Reserve Board is closed: the federal holidays as the Board observes
+    them (one on a Saturday on the Friday before, one on a Sunday on the Monday after). Columbus Day, Veterans Day
+    and a Friday 31 December before a Saturday New Year's Day are among them although the NYSE trades."""
+    def nth(month, weekday, n):                  # n-th weekday (Monday 0) of the month; n = -1: the last one
+        if n > 0:
+            d = date(year, month, 1)
+            return d + timedelta(days=(weekday - d.weekday()) % 7 + 7 * (n - 1))
+        d = date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1)
+        return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+    def observed(d):
+        return d - timedelta(days=1) if d.weekday() == 5 else d + timedelta(days=1) if d.weekday() == 6 else d
+
+    fixed = [observed(date(y, m, dd)) for y in (year, year + 1) for m, dd in ((1, 1), (6, 19), (7, 4), (11, 11),
+                                                                              (12, 25))]
+    floating = [nth(1, 0, 3), nth(2, 0, 3), nth(5, 0, -1), nth(9, 0, 1), nth(10, 0, 2), nth(11, 3, 4)]
+    return frozenset(d for d in fixed + floating if d.year == year)
+
+
+def rates_business_day(d: date) -> bool:
+    """A day on which the NYSE trades and the Federal Reserve Board, which publishes H.15, is open."""
+    return CH.is_trading_day(d) and d not in board_holidays(d.year)
+
+
 def rates_cutoff(as_of: date) -> date:
-    """The latest curve date that may discount as_of: RATES_LAG_DAYS trading days before it. The Federal Reserve's
-    H.15 posts a day's Treasury yields on the next business day (about 16:15 New York), so the curve of this date
-    is published before any snapshot or analysis of as_of runs, and a live run and --rebuild-summary pick the same
-    curve for the same day."""
+    """The latest curve date that may discount as_of: RATES_LAG_DAYS days before it on which both the NYSE and the
+    Federal Reserve Board are open. H.15 posts a day's Treasury yields on the Board's next business day (about 16:15
+    New York), so the curve of this date is published before any snapshot or analysis of as_of runs, even after
+    Columbus Day or Veterans Day, and a live run and --rebuild-summary pick the same curve for the same day."""
     d = as_of
     for _ in range(C.RATES_LAG_DAYS):
-        d = CH.prev_trading_day(d)
+        d -= timedelta(days=1)
+        while not rates_business_day(d):
+            d -= timedelta(days=1)
     return d
 
 
-def curve_from_rows(rows, as_of: date):
+def curve_from_rows(rows, as_of: date, failed: dict | None = None):
     """(RateCurve, None) from the latest Treasury row dated on or before rates_cutoff(as_of) and at most
-    RATES_MAX_AGE_DAYS before as_of, else (None, reason)."""
-    cutoff, best = rates_cutoff(as_of), None
+    RATES_MAX_AGE_DAYS before as_of, else (None, reason). `failed` ({year: reason}, from load_rate_history): when the
+    cutoff's year could not be read there is no curve (an older row could stand in for a missing one), and a missing
+    curve says which earlier year of its window was not read."""
+    cutoff, best, failed = rates_cutoff(as_of), None, failed or {}
+    if cutoff.year in failed:
+        return None, f"the Treasury rows of {cutoff.year} could not be read ({failed[cutoff.year]})"
+    gaps = [y for y in range((as_of - timedelta(days=C.RATES_MAX_AGE_DAYS)).year, cutoff.year) if y in failed]
+    gap = f" (the Treasury rows of {gaps[0]} could not be read: {failed[gaps[0]]})" if gaps else ""
     for r in rows or []:
         try:
             d = date.fromisoformat(str(r.get("date"))[:10])
@@ -201,10 +236,10 @@ def curve_from_rows(rows, as_of: date):
         if d <= cutoff and (best is None or d > best[0]):
             best = (d, r)
     if best is None:
-        return None, f"no Treasury curve on or before {cutoff}"
+        return None, f"no Treasury curve on or before {cutoff}{gap}"
     if (as_of - best[0]).days > C.RATES_MAX_AGE_DAYS:
         return None, (f"the latest Treasury curve is from {best[0]}, more than {C.RATES_MAX_AGE_DAYS} days before "
-                      f"{as_of}")
+                      f"{as_of}{gap}")
     curve = SF.RateCurve.from_treasury(best[1])
     return (curve, None) if curve is not None else (None, f"the Treasury curve of {best[0]} has no yields")
 
@@ -218,20 +253,20 @@ def load_rates(ms: MassiveState, as_of: date):
 
 
 def load_rate_history(ms: MassiveState, start: date, end: date):
-    """(rows, None), (rows, reason) when some years failed, or (None, reason) when all did: the Treasury rows from
-    RATES_MAX_AGE_DAYS before `start` through `end`, one request per calendar year (for --rebuild-summary). Days whose
-    year failed are discounted at the fixed rate; the others keep their curve."""
-    lo, rows, failed = start - timedelta(days=C.RATES_MAX_AGE_DAYS), [], []
+    """(rows, failed) for --rebuild-summary: the Treasury rows from RATES_MAX_AGE_DAYS before `start` through `end`,
+    one request per calendar year, and {year: reason} for the years that could not be read (rows is None when none
+    could). Pass both to curve_from_rows: a day whose cutoff falls in a failed year is discounted at the fixed rate,
+    the others keep their curve."""
+    lo, rows, failed = start - timedelta(days=C.RATES_MAX_AGE_DAYS), [], {}
     for year in range(lo.year, end.year + 1):
         a, b = max(lo, date(year, 1, 1)), min(end, date(year, 12, 31))
         got, why = ms.results(MC.TREASURY, **{"date.gte": a.isoformat(), "date.lte": b.isoformat()}, sort="date.asc",
                               limit=400)
         if got is None:
-            failed.append(f"{year}: {why}")
+            failed[year] = why
             continue
         rows += got
-    why = "; ".join(failed) or None
-    return (None, why) if failed and not rows else (rows, why)
+    return (None if failed and not rows else rows), failed
 
 
 def rates_block(curve, reason: str | None, european: bool) -> dict:

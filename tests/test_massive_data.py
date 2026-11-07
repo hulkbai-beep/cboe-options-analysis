@@ -183,12 +183,26 @@ def test_rate_curve_skips_junk_yields():
     assert SF.discount_rate(None, 0.5) == C.DISCOUNT_RATE and SF.discount_rate(curve, 0.5) == curve.rate(0.5)
 
 
-def test_rates_cutoff_is_two_trading_days_back():
+def test_rates_cutoff_is_two_business_days_back():
     assert C.RATES_LAG_DAYS == 2
     assert fetch.rates_cutoff(AS_OF) == date(2026, 11, 3)                       # Thursday -> Tuesday
     assert fetch.rates_cutoff(date(2026, 11, 9)) == date(2026, 11, 5)           # Monday -> Thursday
     assert fetch.rates_cutoff(date(2026, 11, 8)) == date(2026, 11, 5)           # a Sunday: Friday, then Thursday
     assert fetch.rates_cutoff(date(2026, 11, 27)) == date(2026, 11, 24)         # Thanksgiving is skipped
+    assert fetch.rates_cutoff(date(2026, 4, 6)) == date(2026, 4, 1)             # Good Friday (NYSE closed) too
+    # the NYSE trades but the Federal Reserve Board (H.15) is closed: the curve of the day before would only be
+    # posted on as_of itself, so these days do not count either
+    assert fetch.rates_cutoff(date(2026, 10, 13)) == date(2026, 10, 8)          # after Columbus Day
+    assert fetch.rates_cutoff(date(2026, 11, 12)) == date(2026, 11, 9)          # after Veterans Day
+    assert fetch.rates_cutoff(date(2026, 11, 13)) == date(2026, 11, 10)
+    assert fetch.rates_cutoff(date(2028, 1, 3)) == date(2027, 12, 29)           # New Year's Day on a Saturday
+    assert {d for d in fetch.board_holidays(2026) if CH.is_trading_day(d)} == {date(2026, 10, 12), date(2026, 11, 11)}
+    assert {d for d in fetch.board_holidays(2027) if CH.is_trading_day(d)} == {
+        date(2027, 10, 11), date(2027, 11, 11), date(2027, 12, 31)}
+    assert date(2028, 11, 10) in fetch.board_holidays(2028)                     # Veterans Day on a Saturday
+    assert date(2027, 7, 5) in fetch.board_holidays(2027)                       # Independence Day on a Sunday
+    assert set(C.MARKET_HOLIDAYS) - {date(2026, 4, 3), date(2027, 3, 26)} <= (
+        fetch.board_holidays(2026) | fetch.board_holidays(2027))                # every NYSE holiday but Good Friday
 
 
 def test_curve_from_rows_takes_the_latest_day_up_to_the_cutoff():
@@ -216,7 +230,7 @@ def test_curve_from_rows_takes_the_latest_day_up_to_the_cutoff():
 def test_load_rates_asks_for_the_latest_row():
     fake = FakeMassive()
     curve, why = fetch.load_rates(fetch.MassiveState(fake), AS_OF)
-    assert why is None and curve.curve_date == date(2026, 11, 3)                   # two trading days back
+    assert why is None and curve.curve_date == date(2026, 11, 3)                   # two business days back
     assert curve.yields["yield_1_month"] == pytest.approx(0.0403 + 2 * synth.TREASURY_DRIFT / 100)
     assert fake.requests == [(MC.TREASURY, {"date.lte": "2026-11-03", "sort": "date.desc", "limit": 1}, None)]
     curve, why = fetch.load_rates(fetch.MassiveState(fake), date(2026, 11, 8))        # a Sunday: Thursday's row
@@ -230,8 +244,8 @@ def test_load_rates_asks_for_the_latest_row():
 
 def test_load_rate_history_asks_once_per_calendar_year():
     fake = FakeMassive()
-    rows, why = fetch.load_rate_history(fetch.MassiveState(fake), date(2026, 1, 5), AS_OF)
-    assert why is None
+    rows, failed = fetch.load_rate_history(fetch.MassiveState(fake), date(2026, 1, 5), AS_OF)
+    assert failed == {}
     assert [(p, w) for _, p, w in fake.requests] == [
         ({"date.gte": "2025-12-29", "date.lte": "2025-12-31", "sort": "date.asc", "limit": 400}, None),
         ({"date.gte": "2026-01-01", "date.lte": "2026-11-05", "sort": "date.asc", "limit": 400}, None)]
@@ -239,9 +253,9 @@ def test_load_rate_history_asks_once_per_calendar_year():
     assert dates == sorted(dates) and dates[0] == "2025-12-29" and dates[-1] == "2026-11-05"
     assert len(dates) == len(set(dates))
     limited = FakeMassive(rate_limited=(MC.TREASURY,))
-    rows, why = fetch.load_rate_history(fetch.MassiveState(limited), date(2025, 6, 1), AS_OF)
-    assert rows is None and why.startswith("2025: skipped for Massive's rate limit") and len(limited.requests) == 2
-    assert "; 2026: skipped for Massive's rate limit" in why
+    rows, failed = fetch.load_rate_history(fetch.MassiveState(limited), date(2025, 6, 1), AS_OF)
+    assert rows is None and list(failed) == [2025, 2026] and len(limited.requests) == 2
+    assert all(why.startswith("skipped for Massive's rate limit") for why in failed.values())
 
     class OldYearRestricted(FakeMassive):                                    # e.g. beyond the plan's history
         def results(self, path, ttl=None, wait=None, **params):
@@ -251,9 +265,46 @@ def test_load_rate_history_asks_once_per_calendar_year():
             return super().results(path, ttl=ttl, wait=wait, **params)
 
     part = OldYearRestricted()
-    rows, why = fetch.load_rate_history(fetch.MassiveState(part), date(2025, 6, 1), AS_OF)
-    assert why == "2025: restricted on the current Massive plan: /fed/v1/treasury-yields"
+    rows, failed = fetch.load_rate_history(fetch.MassiveState(part), date(2025, 6, 1), AS_OF)
+    assert failed == {2025: "restricted on the current Massive plan: /fed/v1/treasury-yields"}
     assert rows and min(r["date"] for r in rows) == "2026-01-02" and len(part.requests) == 2
+
+
+def test_an_older_year_never_stands_in_for_a_year_that_could_not_be_read():
+    rows = flat_rows({date(2026, 12, 30): 4.0, date(2026, 12, 31): 4.1})       # the 2027 request failed
+    failed = {2027: "Massive error on /fed/v1/treasury-yields: HTTP 503 (server error)"}
+    # cutoff 2027-01-04 lies in 2027: the 2026-12-31 row would stand in for rows that were never read
+    assert fetch.curve_from_rows(rows, date(2027, 1, 6), failed) == (
+        None, "the Treasury rows of 2027 could not be read (Massive error on /fed/v1/treasury-yields: HTTP 503 "
+              "(server error))")
+    curve, why = fetch.curve_from_rows(rows, date(2027, 1, 5), failed)       # cutoff 2026-12-31: a year that was read
+    assert why is None and curve.curve_date == date(2026, 12, 31)
+    # 2026 failed: a day whose cutoff is in 2026 has no curve, and a day without a 2027 row says why
+    later = flat_rows({date(2027, 1, 5): 4.2})
+    assert fetch.curve_from_rows(later, date(2027, 1, 5), {2026: "x"}) == (
+        None, "the Treasury rows of 2026 could not be read (x)")
+    assert fetch.curve_from_rows(later, date(2027, 1, 6), {2026: "x"}) == (
+        None, "no Treasury curve on or before 2027-01-04 (the Treasury rows of 2026 could not be read: x)")
+    curve, why = fetch.curve_from_rows(later, date(2027, 1, 7), {2026: "x"})
+    assert why is None and curve.curve_date == date(2027, 1, 5)
+
+    class NewYearFails(FakeMassive):
+        def results(self, path, ttl=None, wait=None, **params):
+            if str(params.get("date.gte", "")).startswith("2027"):
+                self.requests.append((path, dict(params), wait))
+                raise MC.MassiveError(f"HTTP 503 on {path} (server error)")
+            return super().results(path, ttl=ttl, wait=wait, **params)
+
+    days = {date(2026, 12, d): 4.0 for d in (28, 29, 30, 31)} | {date(2027, 1, d): 5.0 for d in (4, 5, 6, 7)}
+    facts = snapshot.SymbolFacts(fetch.FmpState(None), fetch.MassiveState(NewYearFails(
+        data={(MC.TREASURY, None): flat_rows(days)})))
+    facts.preload_rates(date(2026, 12, 29), date(2027, 1, 8))
+    assert facts.rates(date(2026, 12, 31)).curve_date == date(2026, 12, 29)
+    assert facts.rates(date(2027, 1, 5)).curve_date == date(2026, 12, 31)    # its cutoff is in 2026
+    for d in (date(2027, 1, 6), date(2027, 1, 7), date(2027, 1, 8)):          # cutoffs in 2027: the fixed rate
+        assert facts.rates(d) is None
+        assert facts._curves[d][1] == ("the Treasury rows of 2027 could not be read (Massive error on "
+                                       "/fed/v1/treasury-yields: HTTP 503 on /fed/v1/treasury-yields (server error))")
 
 
 def test_rates_block():
@@ -1071,7 +1122,7 @@ def test_rebuild_summary_uses_each_days_curve(tmp_path, no_network):
     feed = tmp_path / "feed"
     for d in (day1, day2):
         synth.write_chain(feed / "cboe" / d.isoformat(), xsp_chain(d))
-    cut = {day1: date(2026, 11, 2), day2: date(2026, 11, 3)}         # two trading days back
+    cut = {day1: date(2026, 11, 2), day2: date(2026, 11, 3)}         # two business days back
     # a different curve for every cutoff; the rows of day1 and day2 themselves (published later) are never used
     levels = {date(2026, 10, 30): 9.0, cut[day1]: 2.0, cut[day2]: 6.0, day1: 50.0, day2: 50.0}
     data = {(MC.TREASURY, None): flat_rows(levels)}

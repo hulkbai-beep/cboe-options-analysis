@@ -192,7 +192,8 @@ in `meta.config_snapshot`.
   run fills the window with its first five requests, so its calendar check is usually skipped; a later run
   fetches it and the calendar is then cached for a day.
 - **Retries:** `MASSIVE_TIMEOUT` (30) seconds per response; HTTP 5xx up to 3 tries, 1 and 2 seconds apart, a
-  retry only when a request slot is free at once (a retry never makes a later request wait); when two requests
+  retry only when a request slot is free at once (a retry never waits itself, but it uses that slot, so on the
+  free plan a later request of the run may then wait for the next minute); when two requests
   in a row end on server errors, the later requests fail at once for 5 minutes
   ("Massive answered server errors (HTTP 5xx) to 2 requests in a row: its other requests are skipped for a few
   minutes", one note in `meta.notes`). No HTTP response twice, or a failed certificate check, makes Massive
@@ -245,7 +246,7 @@ Per expiry, on the surface contracts:
    σ, T)] = straddle by bisection on σ in [0.0001, 10] to a width of 1e-10 (at most 200 steps).
    B76 straddle = D · [F(2N(d₁) − 1) − K(2N(d₂) − 1)], d₁ = (ln(F/K) + σ²T/2)/(σ√T), d₂ = d₁ − σ√T.
    D = e^(−r(T) · T) for European roots (`EUROPEAN_ROOTS`), with r(T) from the Treasury curve of section 2.1
-   (two trading days before the data date), or the fixed `DISCOUNT_RATE` = 0.04 without one; D = 1 otherwise. A straddle below intrinsic value or
+   (two business days before the data date), or the fixed `DISCOUNT_RATE` = 0.04 without one; D = 1 otherwise. A straddle below intrinsic value or
    above the σ = 10 price has no solution: then `atm_iv = atm_iv_cboe` and `atm_iv_source = "cboe_fallback"`.
    - Why: CBOE's own short-dated SPX IVs do not match its quotes (a 1-day SPX straddle backs out about 0.92
      × CBOE's IV), so the straddle price, not the reported IV, sets the ATM level.
@@ -264,11 +265,14 @@ Per expiry, on the surface contracts:
   compounded rates r = 2 ln(1 + y/2), y as a decimal. r(T) is linear in T between the tenors and flat before 1
   month and beyond 30 years; D = e^(−r(T) · T). A yield that is not a number or lies outside −5% to 30% is
   left out.
-- **Which day:** the latest curve dated on or before `rates_cutoff(as_of)`, `RATES_LAG_DAYS` (2) trading days
-  before `as_of`. The Federal Reserve's H.15 posts a day's yields on the next business day (about 16:15 New
-  York), so that curve is always published before the day's snapshot (16:30-20:00) or any analysis of `as_of`,
-  and a live run and `--rebuild-summary` months later pick the same curve for the same day. A curve more than
-  `RATES_MAX_AGE_DAYS` (7) calendar days older than `as_of` is not used.
+- **Which day:** the latest curve dated on or before `rates_cutoff(as_of)`, `RATES_LAG_DAYS` (2) business days
+  before `as_of`, counting only days when the NYSE trades and the Federal Reserve Board is open
+  (`rates_business_day`: the Board closes on the federal holidays, among them Columbus Day and Veterans Day,
+  when the NYSE trades). The Federal Reserve's H.15 posts a day's yields on the Board's next business day (about
+  16:15 New York), so that curve is always published before the day's snapshot (16:30-20:00) or any analysis of
+  `as_of`, and a live run and `--rebuild-summary` months later pick the same curve for the same day. For example,
+  `as_of` 2026-11-05 uses the curve of 2026-11-03, and 2026-11-12, the day after Veterans Day, the curve of
+  2026-11-09. A curve more than `RATES_MAX_AGE_DAYS` (7) calendar days older than `as_of` is not used.
 - **Fixed fallback:** without a usable curve (no key, a failure, a curve too old, a row without yields) European
   straddles are discounted at `DISCOUNT_RATE` (0.04), as before Massive. `snapshot.rates.reason` says why, and
   when the chain has European expiries the note "European index options discounted at the fixed 4% rate:
@@ -288,8 +292,9 @@ Per expiry, on the surface contracts:
   Treasury rows of the whole period in one request per calendar year, each day with the latest curve on or before
   its cutoff within `RATES_MAX_AGE_DAYS`), so a summary row from an analysis, from `snapshot.py` and from
   `--rebuild-summary` is the same computation on the same curve (section 14). A day without a usable curve falls
-  back to `DISCOUNT_RATE` (also the days of a calendar year whose request failed in a rebuild; the other years
-  keep their curves), and `snapshot.py` logs which rate it used. A row saved while Massive was unavailable
+  back to `DISCOUNT_RATE` (in a rebuild, also every day whose cutoff falls in a calendar year whose request
+  failed, since an older curve must not stand in for the missing rows; the other days keep their curves), and
+  `snapshot.py` logs which rate it used. A row saved while Massive was unavailable
   differs from a rebuild that can read the curve, by the size below.
 - **Size of the effect:** a rate difference Δr scales a European ATM IV by about e^(Δr · T): for 1 percentage
   point, about 0.1% of the IV at 30 days and 1% at one year (0.2 vol points on an IV of 20%). Summary rows of a
@@ -609,8 +614,9 @@ $OA_DATA_DIR/                       default ~/options-data
   `total_oi`, `total_volume`, `net_gex_1pct`, `zero_gamma`, `contracts_live`, `feed_time`, `closed`,
   `late_feed` (feed at or after 20:15), `summary_version`. `analyze.py`, `snapshot.py` and
   `--rebuild-summary` compute it with the same function, so the three agree whenever they read the same
-  inputs. A European index row is discounted with the Treasury curve of its cutoff date, two trading days
-  earlier (section 2.1), when Massive is configured, else at `DISCOUNT_RATE`.
+  inputs. A European index row is discounted with the Treasury curve of its cutoff date, two business days
+  earlier (days when both the NYSE and the Federal Reserve Board are open, section 2.1), when Massive is
+  configured, else at `DISCOUNT_RATE`.
 - VIX (futures-settled) is stored as a chain only, without a summary row.
 - **Schedule:** once per trading day between 16:30 and 20:00 New York (SPX, XSP and VIX options trade
   overnight from 20:15). A missed day cannot be recovered. A cloud or sandbox session keeps no history.
@@ -654,8 +660,8 @@ the block is unavailable with the reason. `python scripts/massive_client.py chec
 | Item | Approximation | Why |
 |---|---|---|
 | Forward | median of K + C − P near the money (zero rates, no dividend model) | needs no rate or dividend inputs; accurate near the money; approximate for American options |
-| ATM IV | Black-76 inversion of the ATM straddle; European roots discounted with the Treasury curve of two trading days earlier (Massive) or at 4%, American roots undiscounted | matches the traded prices, unlike CBOE's short-dated SPX IVs; early exercise is ignored |
-| Discount curve | Treasury par yields (bond-equivalent) as continuous rates 2 ln(1 + y/2), linear in T, flat beyond 1 month and 30 years; the curve of two trading days before the data date | a recent risk-free curve, the same in every run of that day; a rate error Δr moves a European ATM IV by a factor of about e^(Δr · T) |
+| ATM IV | Black-76 inversion of the ATM straddle; European roots discounted with the Treasury curve of two business days earlier (Massive) or at 4%, American roots undiscounted | matches the traded prices, unlike CBOE's short-dated SPX IVs; early exercise is ignored |
+| Discount curve | Treasury par yields (bond-equivalent) as continuous rates 2 ln(1 + y/2), linear in T, flat beyond 1 month and 30 years; the curve of two business days before the data date (NYSE and Federal Reserve both open) | a recent risk-free curve, the same in every run of that day; a rate error Δr moves a European ATM IV by a factor of about e^(Δr · T) |
 | Wings and BF25 | CBOE's per-contract IVs, interpolated in delta | CBOE's model for American options and dividends is not published |
 | Constant-maturity IV | linear in total variance, calendar time; flat beyond the listed range | standard; weekends and holidays count as calendar days |
 | Dealer gamma | sign convention (customers sell calls, buy puts); sticky-strike profile; r = q = 0 | the feed shows no customer or dealer side |

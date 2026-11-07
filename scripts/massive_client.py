@@ -141,7 +141,13 @@ def _message(body: str) -> str | None:
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow a redirect: urllib would send the Authorization header (the key) to the new address, whatever its
-    scheme or host. The 3xx answer reaches the client as an error status instead."""
+    scheme or host. The 3xx answer reaches the client as an error status (HTTPError) instead. The http_error_3xx
+    methods return None before urllib reads the Location header, so a malformed one cannot raise either."""
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -304,8 +310,8 @@ class MassiveClient:
         url = self.base + path + (("?" + urllib.parse.urlencode(params)) if params else "")
         no_response, server_errors, last, retry_if_free = 0, 0, None, False
         for attempt in range(HTTP_ATTEMPTS + 1):    # one more than HTTP_ATTEMPTS: a 429 or a lost response retries
-            if retry_if_free:                        # a server-error retry never waits for a slot later requests need
-                try:
+            if retry_if_free:                        # a server-error retry goes out only when a slot is free at once:
+                try:                                 # it never waits, though it takes a slot a later request may need
                     self._slot(0)
                 except RateLimited:
                     break
@@ -326,8 +332,15 @@ class MassiveClient:
                                    "retrying once ..."), file=sys.stderr, flush=True)
                 self._sleep(1)
                 continue
-            except ValueError:                       # a header http.client cannot send: only the key is variable
-                raise InvalidKey("MASSIVE_API_KEY contains characters that cannot be sent in a header") from None
+            except ValueError as e:
+                header = isinstance(e, UnicodeEncodeError) and e.encoding == "latin-1"
+                if header or str(e).startswith("Invalid header"):
+                    # a header http.client cannot send: only the key varies (its text may hold the key: not shown)
+                    raise InvalidKey("MASSIVE_API_KEY contains characters that cannot be sent in a header") from None
+                # anything else fails this request alone; only an encoding error's text is shown (a proxy setting's
+                # text may hold a password)
+                detail = f": {_plain(str(e), 120)}" if isinstance(e, UnicodeError) else ""
+                raise MassiveError(self._redact(f"{path}: request failed ({type(e).__name__}{detail})")) from None
             self.stats["network_calls"] += 1
             body = self._redact(body)
             msg = _plain(_message(body), 200)

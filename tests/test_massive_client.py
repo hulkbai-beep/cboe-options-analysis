@@ -388,9 +388,12 @@ def test_a_redirect_is_an_error_and_nothing_is_cached(tmp_path, status):
     assert len(t.calls) == 1 and [p.name for p in files(tmp_path / "cache")] == [MC.RATE_FILE]
 
 
-def test_the_opener_never_follows_a_redirect(monkeypatch):
-    """A local plain-HTTP server answers 302 to another path: the client's opener stops there, so the
-    Authorization header (the key) never reaches the new address."""
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("location", ["http://127.0.0.1:{port}/elsewhere", "http://[gateway]/blocked",
+                                      "http://[broken/x"])
+def test_the_opener_never_follows_a_redirect(monkeypatch, status, location):
+    """A local plain-HTTP server answers a redirect to another path: the client's opener stops there, so the
+    Authorization header (the key) never reaches the new address; a malformed Location is never parsed."""
     import http.server
     import threading
     hits = []
@@ -399,8 +402,8 @@ def test_the_opener_never_follows_a_redirect(monkeypatch):
         def do_GET(self):
             hits.append((self.path, self.headers.get("Authorization")))
             if self.path == "/start":
-                self.send_response(302)
-                self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/elsewhere")
+                self.send_response(status)
+                self.send_header("Location", location.format(port=self.server.server_port))
             else:
                 self.send_response(200)
             self.send_header("Content-Length", "0")
@@ -419,12 +422,37 @@ def test_the_opener_never_follows_a_redirect(monkeypatch):
                                      headers={"Authorization": f"Bearer {KEY}"})
         with pytest.raises(urllib.error.HTTPError) as e:
             opener.open(req, timeout=10)
-        assert e.value.code == 302
+        assert e.value.code == status
     finally:
         server.shutdown()
         server.server_close()
     assert hits == [("/start", f"Bearer {KEY}")]                      # /elsewhere was never asked
     assert any(isinstance(h, MC._NoRedirect) for h in opener.handlers)
+    assert not any(type(h) is urllib.request.HTTPRedirectHandler for h in opener.handlers)
+
+
+def test_only_a_header_error_is_a_key_problem(tmp_path):
+    """A ValueError while sending is a key problem only when http.client refused a header (the key is the only
+    header that varies); any other ValueError fails that request alone, and the next request still goes out."""
+    secret = "proxy URL with no authority: 'http:/user:pa55@proxy:3128'"
+    t = FakeTransport({MC.SHORT_INTEREST: [ValueError(secret)],
+                       MC.FLOAT: [UnicodeEncodeError("ascii", "/v2/ré", 4, 5, "ordinal not in range(128)")],
+                       MC.NEWS: [ok({"results": [{"id": "n1"}]})]})
+    c = make(tmp_path, t)
+    with pytest.raises(MC.MassiveError) as e:
+        c.results(MC.SHORT_INTEREST, ticker="ACME")
+    assert type(e.value) is MC.MassiveError and str(e.value) == "/stocks/v1/short-interest: request failed (ValueError)"
+    with pytest.raises(MC.MassiveError) as e:                                   # a request line that is not ASCII
+        c.results(MC.FLOAT, ticker="ACME")
+    assert type(e.value) is MC.MassiveError and "request failed (UnicodeEncodeError: 'ascii' codec" in str(e.value)
+    assert c.results(MC.NEWS, ticker="ACME") == [{"id": "n1"}]
+    bad = make(tmp_path / "b", FakeTransport({MC.NEWS: [ValueError(f"Invalid header value b'Bearer {KEY}'")]}))
+    with pytest.raises(MC.InvalidKey) as e:
+        bad.results(MC.NEWS, ticker="ACME")
+    assert KEY not in str(e.value) and "cannot be sent in a header" in str(e.value)
+    enc = make(tmp_path / "c", FakeTransport({MC.NEWS: [UnicodeEncodeError("latin-1", "“", 0, 1, "x")]}))
+    with pytest.raises(MC.InvalidKey):
+        enc.results(MC.NEWS, ticker="ACME")
 
 
 # ---------------------------------------------------------------------------- no response, certificates
@@ -520,6 +548,7 @@ def test_one_tls_trust_per_client_and_the_opener_uses_it(tmp_path, monkeypatch, 
 
     def fake_open(self, req, data=None, timeout=None):             # the client's own opener, never the network
         https = [h for h in self.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+        assert any(isinstance(h, MC._NoRedirect) for h in self.handlers)
         opened.append((req.full_url, https[0]._context, timeout))
         return FakeResponse(req.full_url, 200, {"Content-Type": "application/json"}, b'{"results": [{"x": 1}]}')
 

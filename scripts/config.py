@@ -58,8 +58,9 @@ NEWS_FETCH = 50                   # articles read per run
 NEWS_ROWS = 8                     # headlines kept in metrics.json (newest first)
 NEWS_FOCUS_MAX_TICKERS = 3        # articles tagged with at most this many tickers are kept first (roundups after)
 NEWS_TEXT_CHARS = 300             # titles and sentiment reasoning are cut to this many characters
-RATES_LAG_DAYS = 2                # the curve that discounts a day is the latest one dated this many trading days
-                                  # earlier or before (always published by then; fetch.rates_cutoff)
+RATES_LAG_DAYS = 2                # the curve that discounts a day is the latest one dated this many days earlier
+                                  # or before, counting days when both the NYSE and the Federal Reserve Board are
+                                  # open (always published by then; fetch.rates_cutoff)
 RATES_MAX_AGE_DAYS = 7            # a Treasury curve dated more than this many calendar days before as_of is not used
 TREASURY_TENORS = (               # Massive /fed/v1/treasury-yields field -> maturity in years (yields in percent)
     ("yield_1_month", 1 / 12), ("yield_3_month", 0.25), ("yield_1_year", 1.0), ("yield_2_year", 2.0),

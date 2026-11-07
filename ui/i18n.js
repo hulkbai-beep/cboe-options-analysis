@@ -35,7 +35,7 @@
       notice_error: e => `Part of the analysis failed and is left out: ${e}`,
       // Massive is optional: what a run without MASSIVE_API_KEY leaves out (an information line, not a warning)
       notice_massive_missing: "Optional: MASSIVE_API_KEY is not set, so short interest, short sale volume, news and the holiday-calendar check are left out.",
-      notice_massive_missing_index: rate => `Optional: MASSIVE_API_KEY is not set, so European index options are discounted at a fixed ${rate} instead of the day's Treasury curve, and the holiday-calendar check is left out.`,
+      notice_massive_missing_index: rate => `Optional: MASSIVE_API_KEY is not set, so European index options are discounted at a fixed ${rate} instead of the Treasury curve, and the holiday-calendar check is left out.`,
       notice_massive_missing_calendar: "Optional: MASSIVE_API_KEY is not set, so the holiday-calendar check is left out.",
       disclaimer: "This is options-market analysis for information only, not investment advice.",
 

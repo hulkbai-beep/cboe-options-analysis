@@ -327,7 +327,8 @@ folder, the output goes to `~/oa-output/` instead.
 - An uncached stock run makes about 8 requests (4 to CBOE, 4 to FMP); the market view about 9. With
   Massive, a stock run with the market context adds 6, an ETF 5 (one more for either when FMP gave no answer
   on dividends: not configured, rejected, unreachable or restricted; one fewer without the market context),
-  an index or the market view 2. The free plan's 5 requests a minute count over all runs, so a run, or a
+  a European index or the market view 2, an American-style index (OEX) 2 with the market context and 1
+  without. The free plan's 5 requests a minute count over all runs, so a run, or a
   second run within a minute, that needs more waits for a slot (the terminal says so; about a minute), and
   the holiday-calendar check, which runs only when a request slot is free at once, is often skipped on the
   first run of the day; it is then cached for a day. When Massive answers "too many requests" (HTTP 429)
@@ -413,11 +414,12 @@ properties, tick "Run task as soon as possible after a scheduled start is missed
 ```
 
 **Discounting:** with `MASSIVE_API_KEY` set, the summary rows of European indices (SPX, NDX, RUT, XSP) are
-discounted with the latest Treasury curve dated two trading days or more before that day (the Federal
-Reserve posts a day's yields on the next business day, so this curve is always out by the snapshot), in a
-snapshot and in `--rebuild-summary` alike, so both store the same row (the rebuild fetches the curves with one
-request per calendar year; a year it cannot read falls back to the fixed rate); without it at the fixed 4%,
-as in an analysis. The log says which.
+discounted with the latest Treasury curve dated two business days or more before that day (counting days
+when both the NYSE and the Federal Reserve are open, so Columbus Day and Veterans Day are skipped; the
+Federal Reserve posts a day's yields on its next business day, so this curve is always out by the snapshot),
+in a snapshot and in `--rebuild-summary` alike, so both store the same row (the rebuild fetches the curves
+with one request per calendar year; a day whose curve falls in a year it cannot read uses the fixed rate);
+without it at the fixed 4%, as in an analysis. The log says which.
 
 **Continuing an existing history:** chains saved by the earlier prototype script use the same parquet
 schema. Point `OA_DATA_DIR` (or `--data-dir`) at that folder and run `python scripts/snapshot.py
