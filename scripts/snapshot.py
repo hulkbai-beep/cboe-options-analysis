@@ -20,7 +20,10 @@ Run it once per trading day between 16:30 and 20:00 New York time: SPX, XSP and 
 20:15, and an overnight version is never stored. Files are named after the trading day the data belongs to, so
 extra runs (weekends, holidays, retries) skip what is already saved. VIX is stored as a chain only (its options
 settle to VIX futures). With FMP_API_KEY set, the FMP profile decides stock or ETF and the next earnings date
-gives the ex-event 30-day IV of stocks; without it that column stays empty.
+gives the ex-event 30-day IV of stocks; without it that column stays empty. With MASSIVE_API_KEY set, European
+index options (SPX, NDX, RUT, XSP) are discounted with the Treasury curve of the second business day before the data
+date, counting days when both the NYSE and the Federal Reserve Board are open (fetch.rates_cutoff: always published
+by then), as in an analysis and in --rebuild-summary; without it at the fixed DISCOUNT_RATE.
 
 Every run is logged to <data-dir>/logs/snapshot.log as well as the console.
 Exit codes: 0 done; 1 at least one symbol failed (the others are still saved); 2 bad arguments.
@@ -46,11 +49,48 @@ LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 
 # ---------------------------------------------------------------------------- kind and earnings (FMP optional)
 class SymbolFacts:
-    """kind (4.1) and the FMP earnings rows of each symbol, asked once per run."""
+    """kind (4.1) and the FMP earnings rows of each symbol, asked once per run, and the Treasury discount curve of
+    each trading day (Massive, optional)."""
 
-    def __init__(self, fs: fetch.FmpState):
+    def __init__(self, fs: fetch.FmpState, ms: fetch.MassiveState | None = None):
         self.fs = fs
+        self.ms = ms if ms is not None else fetch.MassiveState(None)
         self._earnings: dict[str, tuple] = {}
+        self._curves: dict = {}                  # as_of -> (RateCurve or None, reason)
+        self._history = None                     # (start, end, rows or None, {failed year: reason}) after preload_rates
+        self._logged: set = set()
+
+    def preload_rates(self, start, end) -> None:
+        """Read the Treasury rows of [start, end] in a few requests (for --rebuild-summary)."""
+        if self._history is not None and self._history[0] <= start and end <= self._history[1]:
+            return
+        if self._history is not None:
+            start, end = min(start, self._history[0]), max(end, self._history[1])
+        rows, failed = fetch.load_rate_history(self.ms, start, end)
+        self._history = (start, end, rows, failed)
+        self._curves.clear()
+
+    def rates(self, as_of):
+        """The RateCurve that discounts European straddles on as_of, or None (the fixed DISCOUNT_RATE)."""
+        if as_of not in self._curves:
+            h = self._history
+            if h is not None and h[0] <= as_of <= h[1]:
+                if h[2] is None:                                         # no year of the history could be read
+                    self._curves[as_of] = (None, "; ".join(f"{y}: {why}" for y, why in h[3].items()))
+                else:
+                    self._curves[as_of] = fetch.curve_from_rows(h[2], as_of, h[3])
+            else:
+                self._curves[as_of] = fetch.load_rates(self.ms, as_of)
+            curve, why = self._curves[as_of]
+            label = f"Treasury curve of {curve.curve_date}" if curve is not None else f"fixed rate ({why})"
+            if label not in self._logged:
+                self._logged.add(label)
+                if curve is not None:
+                    log.info("European index options discounted with the %s", label)
+                else:
+                    log.info("European index options discounted at the fixed %.0f%% rate: %s", C.DISCOUNT_RATE * 100,
+                             why)
+        return self._curves[as_of][0]
 
     def kind(self, sym: dict) -> str:
         if sym["kind"] == "index" or not sym.get("fmp"):
@@ -119,7 +159,8 @@ def snapshot_one(cboe, facts: SymbolFacts, text: str, root: Path, force: bool = 
             else:
                 earnings_date = M.next_earnings(rows, as_of, session["closed"])
         frame = CH.frame_from_options(payload["data"].get("options") or [])
-        row = H.summary_row(session, frame, kind, earnings_date, key=key)
+        rates = facts.rates(as_of) if kind == "index" else None      # only European (index) straddles are discounted
+        row = H.summary_row(session, frame, kind, earnings_date, key=key, rates=rates)
         H.append_summary(root, key, row, force=force)
         parts.append("summary row written" if (not have_row or force) else "summary row kept")
         if not session["closed"]:
@@ -155,12 +196,15 @@ def rebuild_summary(root: Path, keys: list[str], facts: SymbolFacts) -> list[str
         rows_e, why = facts.earnings(sym) if kind == "stock" else (None, None)
         if kind == "stock" and rows_e is None:
             log.info("%s: %s, ex-event IV not stored", key, why)
+        if kind == "index":
+            facts.preload_rates(dates[0], dates[-1])
         rows, bad = [], 0
         for d in dates:
             try:
                 session, frame = H.load_chain(H.chain_path(root, key, d))
                 ed = M.next_earnings(rows_e, d, True) if rows_e else None   # stored chains are after the close
-                rows.append(H.summary_row(session, frame, kind, ed, key=key))
+                rates = facts.rates(session["as_of"]) if kind == "index" else None
+                rows.append(H.summary_row(session, frame, kind, ed, key=key, rates=rates))
             except Exception as e:  # one damaged file must not stop the others
                 bad += 1
                 log.error("%s %s: %s: %s", key, d, type(e).__name__, e)
@@ -220,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv=None, cboe=None, fmp=None) -> int:
+def main(argv=None, cboe=None, fmp=None, massive=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -240,7 +284,9 @@ def main(argv=None, cboe=None, fmp=None) -> int:
     try:
         fs = fmp if isinstance(fmp, fetch.FmpState) else fetch.FmpState(*fetch.make_fmp()) if fmp is None \
             else fetch.FmpState(fmp)
-        facts = SymbolFacts(fs)
+        ms = massive if isinstance(massive, fetch.MassiveState) else \
+            fetch.MassiveState(*fetch.make_massive()) if massive is None else fetch.MassiveState(massive)
+        facts = SymbolFacts(fs, ms)
         if fs.client is None:
             log.info("FMP not configured: stocks and ETFs are told apart by the built-in list, ex-event IV not "
                      "stored")
@@ -269,6 +315,8 @@ def main(argv=None, cboe=None, fmp=None) -> int:
                     failed.append(t)
             for note in fs.notes:
                 log.warning("FMP: %s", note)
+        for note in ms.notes:
+            log.warning("Massive: %s", note)
         if failed:
             log.error("failed: %s", " ".join(failed))
         return 1 if failed else 0

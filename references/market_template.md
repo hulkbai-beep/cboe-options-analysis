@@ -143,6 +143,15 @@ interest is as of the previous trading day's close; volume does not show buyer o
 ### 9. Methodology & caveats (方法与说明)
 - Data: `data_source`, the delay and the data time; open interest from the previous trading day; VIX,
   VIX3M and VIX9D histories from CBOE.
+- Discounting (`snapshot.rates`): SPX options are European-style, so SPX's ATM IVs and what is built on
+  them (the term structure, the expected moves, the thermometer flags that read them) used the Treasury
+  curve of `snapshot.rates.curve_date` (30-day rate `snapshot.rates.rate_30d`, 1-year
+  `snapshot.rates.rate_1y`) when `snapshot.rates.source` is `treasury`, or the fixed
+  `snapshot.rates.fixed_rate` with its `reason` when it is `fixed`. SPY, QQQ and IWM options are
+  American-style and not discounted.
+- Calendar check (`data_quality.calendar_check`), as in report_template.md section 13: the calendar in
+  scripts/config.py matches the exchange's from `checked_from` through `checked_through`, or the mismatches
+  next to the `calendar_mismatch` warning, or the reason it is unavailable.
 - The thermometer rules and their thresholds live in `scripts/config.py`; each run records them in
   `meta.config_snapshot`.
 - Approximations: the forward from put-call parity at zero rates, ATM IV backed out of the straddle,
@@ -251,6 +260,9 @@ Open interest is as of the previous trading day's close; volume does not show bu
   CBOE; S&P 500 daily closes from FMP.
 - Forward from put-call parity at zero rates; ATM IV backed out of the ATM straddle; gamma with a
   sticky-strike assumption; probabilities are risk-neutral.
+- SPX straddles were discounted at the fixed 4% rate (Massive not configured); SPY, QQQ and IWM options are
+  American-style and not discounted. Calendar check against the exchange calendar: unavailable (Massive not
+  configured).
 - The history store has 1 day per member: the percentiles of the term ratio, RR25 and GEX need 60.
 - Definitions: references/methodology.md. Interactive charts: chart.html.
 

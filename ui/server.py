@@ -17,8 +17,8 @@ Routes
 Status codes: 404 unknown symbol on CBOE, 502 CBOE unreachable or unusable, 400 invalid symbol or nothing to
 analyse (VIX in ticker mode, no live contracts), 500 anything else (redacted traceback on stderr).
 
-Connection settings come from the environment exactly as for the scripts. On Windows, FMP_* and OA_* values
-saved with `setx` are also read from the registry, so a terminal opened before `setx` still works. For the
+Connection settings come from the environment exactly as for the scripts. On Windows, FMP_*, MASSIVE_* and OA_*
+values saved with `setx` are also read from the registry, so a terminal opened before `setx` still works. For the
 third-party proxy at 54.236.92.205, FMP_TLS_VERIFY=0 is set for this process only, and only if FMP_TLS_VERIFY is
 not set already. The API key is never printed.
 """
@@ -50,8 +50,10 @@ STATIC_TYPES = {
 }
 NO_KEY_WARNING = ("FMP_API_KEY not set: earnings, realized volatility, dividends and the price cone will be "
                   "unavailable")
+NO_MASSIVE_WARNING = ("MASSIVE_API_KEY not set (optional): short interest, news, the Treasury discount curve and the "
+                      "holiday-calendar check will be unavailable")
 
-_lock = threading.Lock()  # the CBOE/FMP caches, rate limits and the history store: one analysis at a time
+_lock = threading.Lock()  # the CBOE/FMP/Massive caches, rate limits and the history store: one analysis at a time
 
 
 # ---------------------------------------------------------------------------- environment
@@ -67,10 +69,11 @@ def apply_proxy_tls_rule() -> bool:
 
 
 def redact(text: str) -> str:
-    """Remove the API key (and any apikey=... query value) from a message."""
-    key = os.environ.get("FMP_API_KEY", "").strip()
-    if key:
-        text = text.replace(key, "***")
+    """Remove the API keys (and any apikey=... query value) from a message."""
+    for name in ("FMP_API_KEY", "MASSIVE_API_KEY"):
+        key = os.environ.get(name, "").strip()
+        if key:
+            text = text.replace(key, "***")
     return re.sub(r"(?i)(apikey=)[^&\s\"']+", r"\1***", text)
 
 
@@ -228,6 +231,8 @@ def main(argv=None):
               "(this process only).", file=sys.stderr)
     if not os.environ.get("FMP_API_KEY"):
         print(f"Warning: {NO_KEY_WARNING}. See SKILL.md > Setup.", file=sys.stderr)
+    if not os.environ.get("MASSIVE_API_KEY"):
+        print(f"Note: {NO_MASSIVE_WARNING}. See SKILL.md > Setup.", file=sys.stderr)
 
     srv = make_server(args.port)
     url = f"http://127.0.0.1:{srv.server_address[1]}/"

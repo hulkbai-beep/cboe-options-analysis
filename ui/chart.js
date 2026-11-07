@@ -1,8 +1,10 @@
 // Options-analysis pages for chart.html and the local app (ui/index.html): hand-drawn SVG, no libraries.
 // OAChart.render(root, data) draws the ticker page (header, KPIs, expected-move cone, term structure, strategy
-// screens, smile, open interest, dealer gamma, earnings, summaries, option chain, unusual activity, data notes) or
-// the market page (thermometer, VIX history, SPX term structure and gamma, skew board, expected moves) from the JSON
-// that scripts/chart.py builds. Every number shown comes from that JSON; this file only lays it out.
+// screens, smile, open interest, dealer gamma, earnings, summaries, short interest, news, option chain, unusual
+// activity, data notes with the discount rate and the holiday-calendar check) or the market page (thermometer, VIX
+// history, SPX term structure and gamma, skew board, expected moves) from the JSON that scripts/chart.py builds.
+// Every number shown comes from that JSON; this file only lays it out. Third-party text (news, holiday names) goes
+// through esc() like every other string and is never inserted as HTML.
 (function (global) {
   "use strict";
 
@@ -70,6 +72,17 @@
     } catch (e) { return iso.slice(0, 7); }
   }
   const hhmm = iso => iso ? String(iso).slice(11, 16) : DASH;
+  // "Nov 5, 16:05 ET": a UTC time (news) in New York time like the quote time in the header; marked UTC without Intl
+  function fmtNY(iso) {
+    const d = new Date(iso || "");
+    if (isNaN(d.getTime())) return iso ? String(iso) : DASH;
+    try {
+      return t("ny_time", d.toLocaleString(I18N.locale(), { timeZone: "America/New_York", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }));
+    } catch (e) { return t("utc_time", d.toISOString().slice(0, 16).replace("T", " ")); }
+  }
+  const fmtRate = v => isNum(v) ? fmtPct(v, 2).replace(/\.?0+%$/, "%") : DASH;   // 4% · 4.25% · 3.99%
+  // third-party links: only http(s), checked here again after scripts/chart.py
+  const httpUrl = u => typeof u === "string" && /^https?:\/\/[^\s"'<>`\\\x00-\x1f\x7f]+$/i.test(u) ? u : null;
   function niceTicks(lo, hi, n) {
     const raw = (hi - lo) / Math.max(1, n), mag = 10 ** Math.floor(Math.log10(raw || 1));
     const step = [1, 2, 2.5, 5, 10].find(m => m * mag >= raw) * mag, out = [];
@@ -239,7 +252,15 @@
       out.push(t("notice_proxy", c.base || "") + (c.tls_verify === false ? " " + t("notice_tls") : ""));
     }
     for (const e of n.errors || []) out.push(t("notice_error", e));
-    return out.length ? `<div class="oa-notices" role="status">${out.map(x => `<div class="oa-warn">${esc(x)}</div>`).join("")}</div>` : "";
+    const info = m.massive_configured ? "" : `<div class="oa-info">${esc(massiveMissing(d))}</div>`;
+    return out.length || info ? `<div class="oa-notices" role="status">${out.map(x => `<div class="oa-warn">${esc(x)}</div>`).join("")}${info}</div>` : "";
+  }
+
+  // What a run without MASSIVE_API_KEY leaves out (Massive is optional): an information line, not a warning.
+  function massiveMissing(d) {
+    const m = d.meta || {}, r = (d.data_notes || {}).rates || {};
+    if (m.mode !== "market" && m.kind !== "index") return t("notice_massive_missing");
+    return r.european ? t("notice_massive_missing_index", fmtRate(r.fixed_rate)) : t("notice_massive_missing_calendar");
   }
 
   const tile = (key, val, sub = "", cls = "", title = "", extra = "") =>
@@ -665,6 +686,8 @@
   }
 
   function stratLabel(name, kind) { return name === "short_put" && kind === "index" ? t("strat_short_put_index") : tv("strat_", name); }
+  // where the ex-dividend dates of the covered-call screen came from (FMP, else Massive), or that none are known
+  const divSource = ctx => ctx && ctx.dividends_source ? t("exdiv_source", tv("divsrc_", ctx.dividends_source)) : t("exdiv_unknown");
 
   function strategiesBody(st) {
     const d = st.data.strategies || {};
@@ -684,6 +707,7 @@
         body = `<p class="oa-small" style="margin:0 0 6px">${esc(rule)} · ${esc(t("candidates_n", sc.candidates))} · ` +
           `<button type="button" class="oa-link" data-all="${st.stratTab}">${esc(all ? t("show_per_expiry") : (sc.candidates || 0) <= (sc.all || []).length ? t("show_all_candidates", sc.candidates || 0) : t("show_candidates", (sc.all || []).length))}</button></p>` +
           (rows.length ? tableHtml("strat", STRAT_COLS[st.stratTab].filter(c => c !== "earn" || kind === "stock"), rows, st.sort.strat) : empty(t("no_rows"))) +
+          (st.stratTab === "covered_call" ? `<p class="oa-small">${esc(divSource(d.context))}</p>` : "") +
           (notesOf(sc).length ? `<ul class="oa-list">${notesOf(sc).map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : "");
       }
     }
@@ -764,6 +788,90 @@
     ]) + `<p class="oa-small">${esc(said((d.data_notes || {}).oi_note || "", { id: "" }, ""))}</p>`;
   }
 
+  // ------------------------------------------------------------------ short interest and news (Massive, optional)
+  const unavail = reason => `<p class="oa-small">${esc(t("unavailable"))}${reason ? ": " + esc(reason) : ""}</p>`;
+  const mutedOf = b => `<span class="oa-sub">${esc(t("unavailable"))}${b && b.reason ? ": " + esc(b.reason) : ""}</span>`;
+  const srcTitle = (title, b) => `${esc(title)}${b && b.source ? ` <span class="oa-badge">${esc(b.source)}</span>` : ""}`;
+  const keepDates = html => html.replace(/\b\d{4}-\d{2}-\d{2}\b/g, '<span class="oa-nw">$&</span>');   // on escaped text only
+
+  // bars from zero, oldest left; each bar's <title> is its tooltip; a dashed line marks `avg`
+  function miniBars(vals, titles, aria, avg) {
+    const W = 240, H = 48, n = vals.length, slot = W / Math.max(1, n);
+    const top = Math.max(...vals.filter(isNum), isNum(avg) ? avg : 0) * 1.08 || 1, y = v => H - Math.max(0, v) / top * (H - 2);
+    let s = vals.map((v, i) => isNum(v) ? `<rect x="${(i * slot + slot * 0.15).toFixed(1)}" y="${y(v).toFixed(1)}" width="${(slot * 0.7).toFixed(1)}" height="${(H - y(v)).toFixed(1)}" fill="var(--line)" opacity=".7"><title>${esc(titles[i])}</title></rect>` : "").join("");
+    if (isNum(avg)) s += `<line x1="0" x2="${W}" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke="var(--event)" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>`;
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none" role="img" aria-label="${esc(aria)}">${s}</svg>`;
+  }
+
+  // positioning.short: short interest (twice a month), daily short sale volume and the free float; stocks and ETFs
+  function shortHtml(d) {
+    const s = (d.positioning || {}).short, kind = (d.meta || {}).kind;
+    if (!s || kind === "index") return "";
+    const title = srcTitle(t("t_short"), s);
+    if (!s.available) return card(title, unavail(s.reason));
+    const si = s.interest || {}, sv = s.volume || {}, fl = s.float || {};
+    const pairs = [];
+    if (si.available) {
+      pairs.push([t("short_interest"), `<b title="${esc(fmtInt(si.short_interest))}">${esc(t("shares_n", fmtCompact(si.short_interest)))}</b>` +
+        (isNum(si.pct_float) ? ` · ${esc(t("of_float", fmtPct(si.pct_float, 1)))}` : "")]);
+      pairs.push([t("days_to_cover"), `${esc(fmtRatio(si.days_to_cover, 1))} <span class="oa-sub">· ${esc(t("adv_v", fmtCompact(si.avg_daily_volume)))}</span>`]);
+      pairs.push([t("si_settled"), `${keepDates(esc(si.settlement_date))} <span class="oa-sub">(${esc(t("age_days", si.age_days))})</span>`]);
+      if (si.prev_settlement_date) pairs.push([t("si_change"), keepDates(esc(t("si_change_v", fmtPct(si.change_pct, 1, true), si.prev_settlement_date, si.settlement_date)))]);
+    } else pairs.push([t("short_interest"), mutedOf(si)]);
+    if (sv.available) {
+      pairs.push([t("short_volume"), `<b>${esc(fmtPct(sv.ratio, 1))}</b> ${keepDates(esc(t("sv_v", fmtCompact(sv.total_volume), sv.date)))}`]);
+      pairs.push([t("short_volume_avg", sv.days), esc(fmtPct(sv.avg_ratio, 1))]);
+    } else pairs.push([t("short_volume"), mutedOf(sv)]);
+    if (kind !== "etf") {
+      pairs.push([t("free_float"), fl.available ? `${esc(t("shares_n", fmtCompact(fl.free_float)))}${isNum(fl.free_float_pct) ? ` <span class="oa-sub">${esc(t("float_pct", fmtPct(fl.free_float_pct, 1)))}</span>` : ""}` +
+        (fl.effective_date ? ` <span class="oa-sub">· ${keepDates(esc(t("effective", fl.effective_date)))}</span>` : "") : mutedOf(fl)]);
+    }
+    const siRows = si.available ? (si.rows || []).slice().reverse() : [], svRows = sv.available ? (sv.rows || []).slice().reverse() : [];
+    const spark = (label, first, last, sub, svg) => `<div class="oa-spark"><div class="k">${esc(label)} · <b>${esc(t("range_v", first, last))}</b> <span class="oa-sub">${esc(sub)}</span></div>${svg}</div>`;
+    const sparks = [];
+    if (siRows.length > 1) {
+      sparks.push(spark(t("spark_si"), fmtCompact(siRows[0].short_interest), fmtCompact(si.short_interest), t("n_settlements", siRows.length),
+        miniBars(siRows.map(r => r.short_interest), siRows.map(r => t("si_bar", r.settlement_date, fmtInt(r.short_interest), fmtRatio(r.days_to_cover, 1))), t("spark_si"))));
+    }
+    if (svRows.length > 1) {
+      sparks.push(spark(t("spark_sv"), fmtPct(svRows[0].ratio, 1), fmtPct(sv.ratio, 1), t("avg_line", fmtPct(sv.avg_ratio, 1)),
+        miniBars(svRows.map(r => r.ratio), svRows.map(r => t("sv_bar", r.date, fmtPct(r.ratio, 1), fmtInt(r.short_volume), fmtInt(r.total_volume))), t("spark_sv"), sv.avg_ratio)));
+    }
+    const table = (head, body) => `<div class="oa-tablewrap"><table class="oa-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    const shares = v => `<td title="${esc(fmtInt(v))}">${esc(fmtCompact(v))}</td>`;     // exact count on hover
+    const tables = (siRows.length ? table(["th_settlement", "th_short_interest", "th_adv", "th_dtc"].map(k => `<th>${esc(t(k))}</th>`).join(""),
+      si.rows.map(r => `<tr><td>${esc(r.settlement_date)}</td>${shares(r.short_interest)}${shares(r.avg_daily_volume)}<td>${esc(fmtRatio(r.days_to_cover, 2))}</td></tr>`).join("")) : "") +
+      (svRows.length ? table(["th_date", "th_short_volume", "th_total_volume", "th_short_ratio"].map(k => `<th>${esc(t(k))}</th>`).join(""),
+        sv.rows.map(r => `<tr><td>${esc(r.date)}</td>${shares(r.short_volume)}${shares(r.total_volume)}<td>${esc(fmtPct(r.ratio, 1))}</td></tr>`).join("")) : "");
+    const notes = [...notesOf(si), ...notesOf(sv)];
+    return card(title, kv(pairs) + (sparks.length ? `<div class="oa-sparks oa-short-sparks">${sparks.join("")}</div>` : "") +
+      (tables ? `<details class="oa-short-hist"><summary class="oa-small">${esc(t("short_history"))}</summary>${tables}</details>` : "") +
+      (notes.length ? `<ul class="oa-list">${notes.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""));
+  }
+
+  // news: the latest headlines with the provider's sentiment label for this ticker. Every string is third-party
+  // text: escaped, never inserted as HTML; a title links out only to an http(s) address.
+  function newsHtml(d) {
+    const n = d.news, m = d.meta || {};
+    if (!n || m.kind === "index") return "";
+    const title = srcTitle(t("t_news"), n);
+    if (!n.available) return card(title, unavail(n.reason));
+    const c = n.sentiment_counts || {}, rows = n.rows || [];
+    const counts = [...["positive", "neutral", "negative"].map(k => `${tv("sent_", k)} ${c[k] ?? 0}`), `${t("news_unlabeled")} ${c.unlabeled ?? 0}`].join(" · ");
+    const items = rows.map(r => {
+      const href = httpUrl(r.url), sent = ["positive", "neutral", "negative"].includes(r.sentiment) ? r.sentiment : null;
+      const line = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer nofollow">${esc(r.title)}</a>` : esc(r.title);
+      const badge = `<span class="oa-sent ${sent || "none"}" title="${esc(t("sent_title", m.ticker))}">${esc(sent ? tv("sent_", sent) : t("news_unlabeled"))}</span>`;
+      const info = [fmtNY(r.published_utc), r.publisher, isNum(r.n_tickers) && r.n_tickers > 1 ? t("news_tickers", r.n_tickers) : ""].filter(Boolean).map(esc).join(" · ");
+      return `<li><div class="hl">${badge}${line}</div><div class="oa-sub">${info}</div>${r.sentiment_reasoning ? `<div class="why">${esc(r.sentiment_reasoning)}</div>` : ""}</li>`;
+    }).join("");
+    const more = n.n_articles > rows.length ? `<p class="oa-small">${esc(t("news_shown", rows.length, n.n_articles, fmtNY(n.newest)))}</p>` : "";
+    const summary = n.n_articles ? `<p class="oa-small" style="margin:0 0 4px">${esc(t("news_window", n.n_articles, n.window_days, fmtNY(n.window_from)))} · ${esc(counts)}</p>` : "";
+    return card(title, summary +
+      (n.truncated ? `<p class="oa-small" style="margin:0 0 4px">${esc(t("news_truncated"))}</p>` : "") +
+      (items ? `<ul class="oa-news">${items}</ul>` : "") + more + notesOf(n).map(x => `<p class="oa-note">${esc(x)}</p>`).join(""));
+  }
+
   function chainBody(st) {
     const d = st.data.chain || {};
     if (!d.available) return empty(t("no_chain"));
@@ -809,9 +917,52 @@
       : (h && h.days ? Object.entries(h.days).map(([k, v]) => t("member_days", k, v)).join(", ") : "");
     const body = `<div class="oa-notes">${list(t("dn_skipped"), (n.skipped || []).map(s => `<b>${esc(s.module)}</b>: ${esc(s.reason)}`))}` +
       `${list(t("dn_restricted"), (n.restricted || []).map(esc))}${list(t("dn_notes"), notes)}` +
+      `${list(t("dn_rates"), ratesItems(d))}${list(t("dn_calendar"), calendarItems(d))}` +
       `${list(t("dn_history"), hist ? [esc(hist), ...(h.data_dir ? [`<span class="oa-sub">${esc(h.data_dir)}</span>`] : [])] : [])}` +
+      `${list(t("dn_connections"), connectionItems(d))}` +
       `${list(t("dn_approx"), ["approx_surface", "approx_rn", "approx_gex", "approx_oi", "approx_delay"].map(k => esc(t(k))))}</div>`;
     return card(esc(t("t_notes")), body);
+  }
+
+  // snapshot.rates: the discount rate of European-style option prices (Treasury curve from Massive, else the fixed
+  // rate); muted when this chain has only American-style options, which are not discounted
+  function ratesItems(d) {
+    const r = (d.data_notes || {}).rates;
+    if (!r) return [];
+    if (!r.european) {
+      return [`<span class="oa-sub">${esc(t("rates_american"))}${r.source === "treasury" ? " " + esc(t("rates_context", fmtDate(r.curve_date, true), fmtRate(r.rate_30d))) : ""}</span>`];
+    }
+    const lead = `<b>${esc(tv("ratesrc_", r.source))}</b> · `;
+    if (r.source !== "treasury") {
+      const ns = notesOf(r);
+      return [lead + esc(ns.length ? ns.join(" ") : t("rates_fixed_v", fmtRate(r.fixed_rate), r.reason || ""))];
+    }
+    const ys = Object.entries(r.yields || {}).filter(([, v]) => isNum(v)).map(([k, v]) => {
+      const [num, unit] = k.split("_");
+      return `${unit === "month" ? t("tenor_m", num) : t("tenor_y", num)} ${fmtPct(v, 2)}`;
+    });
+    return [lead + esc(t("rates_treasury", fmtDate(r.curve_date, true), fmtRate(r.rate_30d), fmtRate(r.rate_1y))),
+      ...(ys.length ? [`<span class="oa-sub">${esc(t("rates_yields", ys.join(" · ")))}</span>`] : [])];
+  }
+
+  // data_quality.calendar_check: the holidays and early closes in scripts/config.py against the exchange calendar
+  function calendarItems(d) {
+    const c = (d.data_notes || {}).calendar_check;
+    if (!c) return [];
+    if (!c.available) return [`<span class="oa-sub">${esc(t("unavailable"))}${c.reason ? ": " + esc(c.reason) : ""}</span>`];
+    const mm = c.mismatches || [], side = (k, close) => tv("cal_", k) + (close ? " " + close : "");
+    if (!mm.length) return [esc(t("cal_ok", fmtDate(c.checked_through, true), c.n_dates))];
+    return [esc(t("cal_mismatch_n", mm.length, fmtDate(c.checked_through, true))),
+      ...mm.map(x => keepDates(esc(t("cal_row", x.date, x.name, side(x.exchange, x.exchange_close), side(x.config, x.config_close)))))];
+  }
+
+  // meta.connection (FMP) and meta.massive_connection: route, base URL and this run's network calls
+  function connectionItems(d) {
+    const m = d.meta || {};
+    const one = (name, c, optional) => c
+      ? esc(t("conn_v", name, c.route || "", c.base || "", c.calls ?? 0)) + (c.tls_verify === false ? ` · <b>${esc(t("conn_tls_off"))}</b>` : "")
+      : `<span class="oa-sub">${esc(optional ? t("conn_none_optional", name) : t("conn_none", name))}</span>`;
+    return [one("FMP", m.connection, false), one("Massive", m.massive_connection, true)];
   }
 
   // ------------------------------------------------------------------ market page pieces
@@ -946,6 +1097,8 @@
         ${earningsCard}
         ${card(esc(t("t_skew_term")), skewTermSummary(d))}
         ${card(esc(t("t_positioning")), positioningSummary(d))}
+        ${shortHtml(d)}
+        ${newsHtml(d)}
         ${card(esc(t("t_chain")), `<div class="oa-chain-body"></div>`, "oa-wide")}
         <section class="oa-card"><details class="oa-flow"${st.flowOpen ? " open" : ""}><summary><h3>${esc(t("t_flow"))}</h3></summary><div class="oa-flow-body"></div></details></section>
         ${marketContextHtml(d)}

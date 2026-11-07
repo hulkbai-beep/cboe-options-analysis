@@ -16,7 +16,7 @@
       app_title: "Options analysis", app_title_market: "US options market thermometer",
       f_symbol: "Symbol", f_mode: "View", mode_ticker: "Ticker", mode_market: "Market",
       c_refresh: "Ignore cache", go: "Analyze",
-      loading: sym => `Analyzing ${sym}… (first run takes about 10-30 s; faster once cached)`,
+      loading: sym => `Analyzing ${sym}… (about 10-30 s on the first run, up to a minute more when Massive's rate limit applies; faster once cached)`,
       loading_market: "Reading SPX, SPY, QQQ, IWM and VIX… (about 30-60 s on the first run)",
       err_symbol: "Enter a valid symbol, e.g. NVDA, BRK.B, SPX.",
       // the page's wording of a refused symbol (error_id); the command-line text points at --market instead
@@ -33,10 +33,16 @@
       notice_proxy: base => `Data comes from a third-party FMP proxy (${base}), not FMP's official server. Verify key figures yourself.`,
       notice_tls: "HTTPS certificate verification was off for this run.",
       notice_error: e => `Part of the analysis failed and is left out: ${e}`,
+      // Massive is optional: what a run without MASSIVE_API_KEY leaves out (an information line, not a warning)
+      notice_massive_missing: "Optional: MASSIVE_API_KEY is not set, so short interest, short sale volume, news and the holiday-calendar check are left out.",
+      notice_massive_missing_index: rate => `Optional: MASSIVE_API_KEY is not set, so European index options are discounted at a fixed ${rate} instead of the Treasury curve, and the holiday-calendar check is left out.`,
+      notice_massive_missing_calendar: "Optional: MASSIVE_API_KEY is not set, so the holiday-calendar check is left out.",
       disclaimer: "This is options-market analysis for information only, not investment advice.",
 
       // units and short formats
       u_pts: "pts", dte_n: n => `${n} DTE`, days_n: n => `${n}d`, years_n: n => `${n}y`, cm_n: d => `${d}d`,
+      ny_time: s => `${s} ET`, utc_time: s => `${s} UTC`, tenor_m: n => `${n}M`, tenor_y: n => `${n}Y`,
+      shares_n: v => `${v} shares`,
 
       // KPI tiles, ticker page
       kpi_price: "Price", kpi_em: "Expected move (±1σ)", kpi_em_next_week: "Next week", kpi_em_monthly: "Monthly",
@@ -134,6 +140,7 @@
       th_capital: "Capital", of_account: v => `${v} of $100k`, th_max_loss: "Max loss", th_theta: "Theta / day",
       th_liquidity: "Liquidity", liq_title: (oi, vol) => `open interest ${oi} · volume ${vol}`,
       th_earnings: "Spans earnings", th_ex_div: "Ex-dividend", th_style: "Style",
+      exdiv_source: src => `Ex-dividend dates from ${src}.`, exdiv_unknown: "No dividend data: ex-dividend dates are unknown.",
       straddle_cost: "Straddle cost", per_contract: v => `${v} per contract`, breakevens: "Breakevens",
       p_beyond_rn: "P(beyond a breakeven), risk-neutral", hold_days: "Holding period",
       hold_days_v: (h, pre, post) => `${h} trading days (${pre} before the event, ${post} after)`,
@@ -154,6 +161,28 @@
       far_otm: "Far out-of-the-money OI", max_pain: "Max pain", weak_evidence: "weak evidence",
       oi_change: "OI change", since: d => `since ${d}`, up_short: "up", down_short: "down",
 
+      // short interest and news (Massive, optional; stocks and ETFs)
+      t_short: "Short interest", t_news: "News",
+      short_interest: "Short interest", of_float: v => `${v} of the free float`,
+      days_to_cover: "Days to cover", adv_v: v => `average daily volume ${v}`,
+      si_settled: "Settlement date", age_days: n => n === 1 ? "1 day old" : `${n} days old`,
+      si_change: "Change", si_change_v: (pct, prev, cur) => `${pct} from ${prev} to ${cur}`,
+      short_volume: "Short sale volume", sv_v: (total, date) => `of ${total} shares reported to FINRA on ${date}`,
+      short_volume_avg: n => `${n}-day average`,
+      free_float: "Free float", float_pct: v => `(${v} of shares outstanding)`, effective: d => `as of ${d}`,
+      spark_si: "Short interest by settlement", spark_sv: "Short sale volume ratio by day",
+      n_settlements: n => `${n} settlements`, avg_line: v => `average ${v} (dashed)`, range_v: (a, b) => `${a} → ${b}`,
+      si_bar: (date, shares, dtc) => `${date}: ${shares} shares short, ${dtc} days to cover`,
+      sv_bar: (date, ratio, sv, total) => `${date}: ${ratio} (${sv} of ${total} shares reported to FINRA)`,
+      short_history: "Settlements and daily short sale volume",
+      th_settlement: "Settlement", th_short_interest: "Short interest", th_adv: "Avg daily volume", th_dtc: "Days to cover",
+      th_date: "Date", th_short_volume: "Short volume", th_total_volume: "FINRA volume", th_short_ratio: "Short %",
+      news_window: (n, days, from) => `${n} ${n === 1 ? "article" : "articles"} in ${days} days (since ${from})`,
+      news_unlabeled: "unlabeled", sent_title: sym => `The news provider's sentiment toward ${sym}`,
+      news_tickers: n => `${n} tickers`,
+      news_shown: (k, n, newest) => `Showing ${k} of ${n}: articles about few tickers first, then roundups; the newest article is from ${newest}.`,
+      news_truncated: "The provider returned as many articles as are read, so the window may hold more: the counts cover the newest ones only.",
+
       // option chain and unusual activity
       no_chain: "no option chain to show", calls: "Calls", puts: "Puts",
       chain_note: (fwd, atm, root, settle, range) => `forward ${fwd} · ATM ${atm} · root ${root}, ${settle} · strikes within ±${range}`,
@@ -169,7 +198,18 @@
 
       // data notes
       dn_skipped: "Left out", dn_restricted: "Limited by missing data", dn_notes: "Notes", dn_history: "History store",
-      dn_approx: "Approximations",
+      dn_approx: "Approximations", dn_rates: "Discount rate", dn_calendar: "Holiday calendar", dn_connections: "Connections",
+      rates_treasury: (date, r30, r1y) => `${date}: ${r30} at 30 days, ${r1y} at 1 year (continuously compounded); European-style options are discounted with it.`,
+      rates_fixed_v: (rate, why) => `European-style options are discounted at a fixed ${rate}${why ? ` (${why})` : ""}.`,
+      rates_yields: list => `Treasury yields (bond-equivalent): ${list}`,
+      rates_american: "Not used: American-style options are not discounted.",
+      rates_context: (date, r30) => `The SPX market context uses the Treasury curve of ${date} (${r30} at 30 days).`,
+      cal_ok: (through, n) => `scripts/config.py matches the exchange calendar through ${through} (${n} holidays and early closes).`,
+      cal_mismatch_n: (n, through) => `${n} ${n === 1 ? "date differs" : "dates differ"} from the exchange calendar (checked through ${through}):`,
+      cal_row: (date, name, exch, conf) => `${date}${name ? ` (${name})` : ""}: exchange ${exch}, scripts/config.py ${conf}`,
+      conn_v: (name, route, base, calls) => `${name}: ${route}, ${base} · ${calls} network ${calls === 1 ? "call" : "calls"} this run`,
+      conn_tls_off: "certificate verification off", conn_none: name => `${name}: not configured`,
+      conn_none_optional: name => `${name}: not configured (optional)`,
       history_v: (days, first, last, saved) => `${days} trading days stored (${first} to ${last}); today's chain ${saved}`,
       saved_yes: "was saved", saved_no: "was not saved",
       member_days: (key, n) => `${key}: ${n} ${n === 1 ? "day" : "days"}`,
@@ -225,6 +265,10 @@
       settle_AM: "AM-settled", settle_PM: "PM-settled", style_american: "American", style_european: "European",
       ivsrc_straddle: "straddle", ivsrc_cboe_fallback: "CBOE IV", iv30src_history: "history store", iv30src_cboe: "CBOE",
       evidence_weak: "weak evidence",
+      sent_positive: "positive", sent_neutral: "neutral", sent_negative: "negative",
+      ratesrc_treasury: "Treasury curve", ratesrc_fixed: "Fixed rate",
+      divsrc_fmp: "FMP", divsrc_massive: "Massive",
+      cal_closed: "closed", cal_early_close: "early close", cal_open: "open",
     },
   };
 

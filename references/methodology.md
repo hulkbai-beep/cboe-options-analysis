@@ -30,7 +30,14 @@ in `meta.config_snapshot`.
 | Earnings dates | FMP `earnings` (stocks only) | earnings module, event expiries, "crosses earnings" fields |
 | Ex-dividend dates and amounts | FMP `dividends` (stocks and ETFs) | the strategy screens' ex-dividend fields |
 | Daily closes, about 3 years (`EOD_LOOKBACK_DAYS` = 1130 calendar days) | FMP `historical-price-eod/full` (split-adjusted, not dividend-adjusted) | realized volatility, past earnings reactions, the price cone |
+| Treasury par yields of one day, 1 month to 30 years | Massive `/fed/v1/treasury-yields` (optional) | the discount rates of European index straddles (section 2.1) |
+| Short interest, daily short sale volume, free float | Massive `/stocks/v1/short-interest`, `/stocks/v1/short-volume`, `/stocks/vX/float` (stocks and ETFs, optional) | `positioning.short` (section 8.1) |
+| Headlines with the provider's sentiment label per ticker | Massive `/v2/reference/news` (stocks and ETFs, optional) | `news` (section 13) |
+| Exchange holidays and early closes | Massive `/v1/marketstatus/upcoming` (optional) | `data_quality.calendar_check` (section 15) |
+| Ex-dividend dates and amounts when FMP gives no answer | Massive `/stocks/v1/dividends` (optional) | the strategy screens' ex-dividend fields |
 
+- Massive (formerly Polygon.io) is optional: without `MASSIVE_API_KEY` nothing is asked and every block it feeds
+  says "Massive not configured" (section 1.7).
 - CBOE answers every request with a 307 redirect to `cdn-api.cboe.com`; both hosts must be reachable.
 - Symbols are case-sensitive at CBOE; indices use an underscore (`_SPX`), share classes a dot (`BRK.B`).
   `scripts/symbols.py` normalizes `$SPX`, `^SPX`, `brk b`, `BRK/B` and similar spellings. A symbol CBOE
@@ -71,8 +78,9 @@ in `meta.config_snapshot`.
   correctly.
 - `dte = (expiration − as_of)` in calendar days, for display and filters.
 - **Exchange calendar:** `MARKET_HOLIDAYS` and `EARLY_CLOSES` (2026-2027). They need a yearly update
-  against the NYSE calendar. Holidays move expiries: the Juneteenth holiday on Friday 2027-06-18 moves that
-  monthly expiry to Thursday 2027-06-17.
+  against the NYSE calendar; with Massive, each run compares them with the exchange's calendar (section 15).
+  Holidays move expiries: the Juneteenth holiday on Friday 2027-06-18 moves that monthly expiry to Thursday
+  2027-06-17.
 - `busdays(a, b)` counts trading days d with a ≤ d < b (weekends and `MARKET_HOLIDAYS` skipped), like
   `numpy.busday_count`.
 
@@ -118,10 +126,13 @@ in `meta.config_snapshot`.
 - `--refresh` skips reading the caches but still writes them. Writes are atomic.
 - FMP responses use `fmp_client.py`'s own session-based cache (`FMP_CACHE_DIR`, default
   `~/.cache/cboe-options-fmp`; the key is never stored).
+- Massive responses use `massive_client.py`'s own cache with one lifetime per endpoint (`MASSIVE_CACHE_DIR`,
+  default `~/.cache/cboe-options-massive`; the key is never stored; section 1.7).
 - **Requests:** at least `CBOE_MIN_INTERVAL` = 1 second apart; `CBOE_TIMEOUT` = 60 seconds each; up to
   `CBOE_ATTEMPTS` = 4 tries on 429, 5xx, a 403 without `AccessDenied` or a network error (waits 2, 4 and 8
   seconds); after two tries with no HTTP response at all the client fails fast. FMP: at most
-  `FMP_MAX_PER_MIN` = 280 requests per minute.
+  `FMP_MAX_PER_MIN` = 280 requests per minute. Massive: at most `MASSIVE_MAX_PER_MIN` = 5 in any 60 seconds,
+  across processes (section 1.7).
 
 ### 1.6 Optional or missing data
 
@@ -130,9 +141,88 @@ in `meta.config_snapshot`.
   key rejected", "FMP unreachable: ..."), `meta.notes` or `meta.restricted` records it, and the run still
   exits 0. Stock / ETF classification then falls back to `KNOWN_ETFS` (SPY, QQQ, IWM, DIA and others),
   otherwise "stock".
+- Massive is optional on the same terms: without `MASSIVE_API_KEY`, or with a rejected key, an unreachable
+  host, an endpoint outside the plan or the rate limit, the blocks it feeds say `available: false` with a
+  reason, European index options are discounted at the fixed `DISCOUNT_RATE` (section 2.1), and the run still
+  exits 0 (section 1.7).
 - `data_source` names the route: "CBOE delayed quotes (~15 min) + FMP stable API (official)", "... via
-  third-party proxy {host}", or "...; FMP not configured". `meta.connection` gives each route's base URL,
-  whether TLS verification is on, and the call counts, never the key.
+  third-party proxy {host}", or "...; FMP not configured". With Massive configured (a key is set, whether or
+  not each piece arrived: `meta.notes`, `meta.restricted` and `meta.skipped` say what did not), " + Massive API" follows
+  the FMP part ("CBOE delayed quotes (~15 min) + FMP stable API (official) + Massive API"), or the CBOE part
+  when FMP is not configured ("CBOE delayed quotes (~15 min) + Massive API; FMP not configured").
+  `meta.connection` gives each route's base URL, whether TLS verification is on, and the call counts, never the
+  key.
+
+### 1.7 Massive (optional, `scripts/massive_client.py`)
+
+- **Connection:** `MASSIVE_BASE` (https://api.massive.com); the free plan is enough. The key comes from
+  `MASSIVE_API_KEY` and goes only into the `Authorization: Bearer` header: never into a URL, a cache file, a file
+  name or the output. Certificates are always verified (`scripts/tls.py`: the operating system's store, certifi,
+  `SSL_CERT_FILE`; one trust context per client). Redirects are never followed (the header would go with them):
+  a 3xx answer is an error ("HTTP {status} on {endpoint} (redirect not followed)") and nothing is cached. A key
+  with characters a header cannot carry (typographic quotes or invisible characters copied with it) counts as
+  rejected.
+- **Requests of a ticker run**, in order of importance:
+
+| # | Request | When | Feeds |
+|---|---|---|---|
+| 1 | Treasury curve: the latest row up to `rates_cutoff(as_of)` | a chain with European roots, or a market context with an SPX chain | section 2.1 |
+| 2 | Short interest: the newest `SHORT_INTEREST_ROWS` (6) settlements | stocks and ETFs | `positioning.short.interest` |
+| 3 | Short sale volume: the newest `SHORT_VOLUME_DAYS` (10) days | stocks and ETFs | `positioning.short.volume` |
+| 4 | Free float | stocks | `positioning.short.float` |
+| 5 | News since `as_of` − `NEWS_LOOKBACK_DAYS`, newest first, at most `NEWS_FETCH` (50) | stocks and ETFs | `news` |
+| 6 | Dividends with an ex-date after `as_of` | stocks and ETFs whose FMP dividends gave no answer | the strategy screens |
+| 7 | Holiday calendar | every run, only when a request slot is free at once | `data_quality.calendar_check` |
+
+  The market view asks for the Treasury curve (SPX's `as_of`) and then the holiday calendar. Uncached, a stock
+  run with the market context makes 6 Massive requests and an ETF 5 (one more when FMP gave no answer on
+  dividends; one fewer without the market context), a European index and the market view 2 each, an
+  American-style index (OEX) 2 with the market context and 1 without. On the free plan a run that needs more than
+  5 waits about a minute for the sixth (the dividends request of a stock without FMP), or skips it (the
+  calendar).
+- **Rate limit:** at most `MASSIVE_MAX_PER_MIN` (5, the free plan) requests in any 60 seconds, counted over every
+  process that shares the cache folder through `rate-window.json` there (request times only), so consecutive
+  runs, `ui/server.py` and `snapshot.py` share one budget. A request waits for a free slot ("[massive] waiting
+  {n}s for the rate limit" on the console); when the slot is further away than `MASSIVE_MAX_WAIT` (65 seconds,
+  one window), or than the request's own limit (0 for the holiday calendar), the request is not sent and its
+  block says "skipped for Massive's rate limit: ...". An HTTP 429 is waited out once (`Retry-After` or
+  `x-ratelimit-reset`, else 60 seconds) within the same limit; when Massive still answers 429, another program
+  may be using the key, and the client's later requests fail at once for 60 seconds with the same reason
+  instead of each waiting again (cached answers are still served). On the free plan an uncached stock
+  run fills the window with its first five requests, so its calendar check is usually skipped; a later run
+  fetches it and the calendar is then cached for a day.
+- **Retries:** `MASSIVE_TIMEOUT` (30) seconds per response; HTTP 5xx up to 3 tries, 1 and 2 seconds apart, a
+  retry only when a request slot is free at once (a retry never waits itself, but it uses that slot, so on the
+  free plan a later request of the run may then wait for the next minute); when two requests
+  in a row end on server errors, the later requests fail at once for 5 minutes
+  ("Massive answered server errors (HTTP 5xx) to 2 requests in a row: its other requests are skipped for a few
+  minutes", one note in `meta.notes`). No HTTP response twice, or a failed certificate check, makes Massive
+  unreachable for the rest of the run (every later request fails at once).
+- **Cache:** one JSON file per request under `MASSIVE_CACHE_DIR` (the endpoint, the ticker and a hash of the
+  parameters in its name, never the key). Lifetimes: news 30 minutes, short sale volume 4 hours, the Treasury
+  curve 6 hours, short interest and dividends 12 hours, the holiday calendar 1 day, the free float 7 days.
+  `--refresh` skips reading it; the rate limit still applies.
+- **Failures become reasons** (`fetch.MassiveState`, as for FMP), never exceptions:
+
+| Failure | Reason in the blocks | Also |
+|---|---|---|
+| no key | "Massive not configured" | nothing is asked; `meta.connection.massive` is null |
+| key rejected (HTTP 401) | "Massive key rejected", for every later piece | `meta.notes`: "Massive key rejected: Massive data is unavailable"; one request spent |
+| no response, certificate check failed | "Massive unreachable: ..." | `meta.notes` |
+| endpoint outside the plan (HTTP 402, 403) | "restricted on the current Massive plan: {endpoint}" | `meta.restricted`: "Massive {endpoint} ({ticker})" |
+| rate limit (also HTTP 429) | "skipped for Massive's rate limit: ..." | |
+| server errors on 2 requests in a row | "Massive answered server errors (HTTP 5xx) to 2 requests in a row: ..." | `meta.notes`, once |
+| any other error | "Massive error on {endpoint}: ..." | `meta.notes` |
+
+- **`meta`:** `meta.connection.massive` = {route, base, tls_verify, calls} (null without Massive);
+  `meta.network_calls` and `meta.cache_hits` include Massive. When Massive is configured, `meta.skipped` names
+  each piece that did not arrive, with its reason: `short_interest`, `short_volume`, `float` (stocks), `news`,
+  `treasury_curve` (runs that discount European options: the chain's or the market context's SPX),
+  `calendar_check`. `dividends` there
+  means neither FMP nor Massive answered ("FMP not configured; Massive: ...").
+- **Command line:** `python scripts/massive_client.py check [SYMBOL]` probes each endpoint on the plan (default
+  NVDA) and compares the holiday calendar with `scripts/config.py`; `get PATH key=value ...` prints the raw JSON;
+  `clear-cache` deletes the cache.
 
 ---
 
@@ -155,14 +245,60 @@ Per expiry, on the surface contracts:
 5. **ATM IV** `atm_iv` (used everywhere downstream): solve D · [B76_call(F, K_atm, σ, T) + B76_put(F, K_atm,
    σ, T)] = straddle by bisection on σ in [0.0001, 10] to a width of 1e-10 (at most 200 steps).
    B76 straddle = D · [F(2N(d₁) − 1) − K(2N(d₂) − 1)], d₁ = (ln(F/K) + σ²T/2)/(σ√T), d₂ = d₁ − σ√T.
-   D = e^(−`DISCOUNT_RATE` · T) with `DISCOUNT_RATE` = 0.04 for European roots (`EUROPEAN_ROOTS`), D = 1
-   otherwise. A straddle below intrinsic value or above the σ = 10 price has no solution: then `atm_iv =
-   atm_iv_cboe` and `atm_iv_source = "cboe_fallback"`.
+   D = e^(−r(T) · T) for European roots (`EUROPEAN_ROOTS`), with r(T) from the Treasury curve of section 2.1
+   (two business days before the data date), or the fixed `DISCOUNT_RATE` = 0.04 without one; D = 1 otherwise. A straddle below intrinsic value or
+   above the σ = 10 price has no solution: then `atm_iv = atm_iv_cboe` and `atm_iv_source = "cboe_fallback"`.
    - Why: CBOE's own short-dated SPX IVs do not match its quotes (a 1-day SPX straddle backs out about 0.92
      × CBOE's IV), so the straddle price, not the reported IV, sets the ATM level.
 6. **Wings:** the 25-delta put and call IVs (`put25_iv`, `call25_iv`) are CBOE's per-contract IVs, averaged
    per delta value and interpolated linearly at Δ −0.25 (puts with −0.50 < Δ < −0.02) and +0.25 (calls with
    0.02 < Δ < 0.50); null when −0.25 / +0.25 is outside the sample.
+
+### 2.1 Discount rates (`snapshot.rates`)
+
+- **Where a rate enters:** only the straddle inversion of European roots (step 5): SPX, SPXW, NDX, NDXP, RUT,
+  RUTW, XSP (and VIX, VIXW, which the ticker view refuses). Their `atm_iv` and everything built on it (expected
+  moves, constant-maturity IVs, the term structure, the event move) depend on it. American roots (stocks and
+  ETFs) are undiscounted; the forward, the wings, gamma and the strategy probabilities use no rate.
+- **The Treasury curve (Massive):** the par yields of one day from `/fed/v1/treasury-yields`
+  (`TREASURY_TENORS`: 1 and 3 months, 1, 2, 5, 10 and 30 years; bond-equivalent, in percent) become continuously
+  compounded rates r = 2 ln(1 + y/2), y as a decimal. r(T) is linear in T between the tenors and flat before 1
+  month and beyond 30 years; D = e^(−r(T) · T). A yield that is not a number or lies outside −5% to 30% is
+  left out.
+- **Which day:** the latest curve dated on or before `rates_cutoff(as_of)`, `RATES_LAG_DAYS` (2) business days
+  before `as_of`, counting only days when the NYSE trades and the Federal Reserve Board is open
+  (`rates_business_day`: the Board closes on the federal holidays, among them Columbus Day and Veterans Day,
+  when the NYSE trades). The Federal Reserve's H.15 posts a day's yields on the Board's next business day (about
+  16:15 New York), so that curve is always published before the day's snapshot (16:30-20:00) or any analysis of
+  `as_of`, and a live run and `--rebuild-summary` months later pick the same curve for the same day. For example,
+  `as_of` 2026-11-05 uses the curve of 2026-11-03, and 2026-11-12, the day after Veterans Day, the curve of
+  2026-11-09. A curve more than `RATES_MAX_AGE_DAYS` (7) calendar days older than `as_of` is not used.
+- **Fixed fallback:** without a usable curve (no key, a failure, a curve too old, a row without yields) European
+  straddles are discounted at `DISCOUNT_RATE` (0.04), as before Massive. `snapshot.rates.reason` says why, and
+  when the chain has European expiries the note "European index options discounted at the fixed 4% rate:
+  {reason}" is added.
+- **When it is asked for:** when the chain has European roots, or the market context has an SPX chain (SPX is
+  European). A stock, ETF or American-style index (OEX) run with `--no-market-context`, or one whose market
+  context has no SPX chain, asks for none: `source` `fixed` with the reason "not needed: no European-style
+  options in this run", and no note.
+- **`snapshot.rates`:** `source` (`treasury` or `fixed`), `european` (this chain has European expiries; false
+  for a stock, ETF or American-style index, whose block then describes the curve the market context's SPX
+  used), `curve_date`, `yields` (by tenor,
+  decimals, bond-equivalent), `rate_30d` and `rate_1y` (the continuous rates r(30/365) and r(1) used for
+  discounting), `fixed_rate` (`DISCOUNT_RATE`), `reason` (fixed only), `notes`. The market view has the same
+  block, for SPX.
+- **One computation everywhere:** the same rule picks the curve for the market context's SPX, the market view's
+  members, `snapshot.py` (each trading day with the curve of its own cutoff) and `--rebuild-summary` (the
+  Treasury rows of the whole period in one request per calendar year, each day with the latest curve on or before
+  its cutoff within `RATES_MAX_AGE_DAYS`), so a summary row from an analysis, from `snapshot.py` and from
+  `--rebuild-summary` is the same computation on the same curve (section 14). A day without a usable curve falls
+  back to `DISCOUNT_RATE` (in a rebuild, also every day whose cutoff falls in a calendar year whose request
+  failed, since an older curve must not stand in for the missing rows; the other days keep their curves), and
+  `snapshot.py` logs which rate it used. A row saved while Massive was unavailable
+  differs from a rebuild that can read the curve, by the size below.
+- **Size of the effect:** a rate difference Δr scales a European ATM IV by about e^(Δr · T): for 1 percentage
+  point, about 0.1% of the IV at 30 days and 1% at one year (0.2 vol points on an IV of 20%). Summary rows of a
+  European index saved with and without the curve differ by that much.
 
 ---
 
@@ -237,7 +373,7 @@ hv20 among the last 252 rolling hv20 values. `vrp = cm_iv_30d − hv20` (positiv
 and `iv_hv_ratio = cm_iv_30d / hv20`.
 
 ### 6.4 IV Rank and history percentiles (`iv_rank`, `iv_rank_ex_event`)
-- History comes from the local store (section 13): H = the last `IVR_LOOKBACK − 1` (251) non-null summary
+- History comes from the local store (section 14): H = the last `IVR_LOOKBACK − 1` (251) non-null summary
   rows before `as_of`, W = H plus today's value x (today's stored row is never counted twice).
 - `n_obs = len(W)`. Below `IVR_MIN_OBS` (60): `available: false`, reason "history {n} days, need 60".
 - `value = (x − min W) / (max W − min W) × 100` (null when max = min); `pctl = 100 × count(W < x) / len(W)`.
@@ -321,6 +457,32 @@ the close. The last `EARNINGS_REACTIONS_MAX` (12) reports; `small_sample` below 
   during trading day T−1.
 - Open interest in the CBOE feed is the previous trading day's close (OCC updates it once each morning).
 
+### 8.1 Short interest and short sale volume (`positioning.short`, Massive)
+
+Stocks and ETFs only (an index: unavailable, "short data applies to stocks and ETFs"). FINRA's figures as
+Massive serves them; rows dated after `as_of` are ignored, and each date counts once.
+- **Short interest** (`interest`): the shares sold short and not yet covered at a settlement date. Brokers
+  report it twice a month (mid-month and month-end settlement dates) and FINRA publishes it about a week later,
+  so the newest figure is one to three weeks old: `age_days` = `as_of` − `settlement_date` in calendar days,
+  with the note "short interest is reported twice a month, about a week after the settlement date". The newest
+  `SHORT_INTEREST_ROWS` (6) settlements are read, about three months (`rows`, newest first).
+  - `short_interest` and `avg_daily_volume` in shares; `days_to_cover` = short interest / average daily volume
+    (Massive's value, computed when missing);
+  - `pct_float` = short interest / free float (null without a free float);
+  - `change_pct` = short interest / the previous settlement's − 1 (`prev_settlement_date`).
+- **Free float** (`float`, stocks): `free_float`, the shares available for public trading, `free_float_pct`, the
+  free float as a fraction of the shares outstanding, and `effective_date` (the latest Massive lists). An ETF
+  has none ("ETFs have no free float"), so its `pct_float` is null.
+- **Short sale volume** (`volume`): for each of the newest `SHORT_VOLUME_DAYS` (10) trading days, `ratio =
+  short_volume / total_volume`, where both count only the trades reported to FINRA's facilities (its trade
+  reporting facilities and the ADF: off-exchange trades), not the consolidated tape. `avg_ratio` is the mean
+  ratio over the `days` rows. Every sale marked short counts, including market makers' short sales that fill
+  buy orders, most of them hedged, so a day's ratio is not short interest and does not show who holds which
+  position: note "short sale volume includes market makers' short sales, most of them hedges: read the trend,
+  not one day".
+- `positioning.short.available` is false only when neither the short interest nor the short sale volume is
+  available; each part keeps its own `reason`. No module reads these figures: they are context.
+
 ---
 
 ## 9. Dealer gamma (`gamma`, every standard root)
@@ -398,7 +560,36 @@ closing: the direction is unknown.
 
 ---
 
-## 13. History store and snapshots (`scripts/history.py`, `scripts/snapshot.py`)
+## 13. News (`news`, Massive)
+
+Stocks and ETFs only (an index: unavailable, "news applies to stocks and ETFs").
+- **Window:** articles about the ticker published from `window_from` = `as_of` − `NEWS_LOOKBACK_DAYS` (3)
+  calendar days, 00:00 UTC (`window_days`), newest first, at most `NEWS_FETCH` (50) read.
+- **Each article** (`rows[*]`): `published_utc` (UTC, ending in `Z`), `publisher`, `title`, `url`,
+  `sentiment`, `sentiment_reasoning`, `n_tickers` (how many tickers the article is tagged with).
+- **Sentiment:** the provider labels an article per ticker. Only the label for this ticker is read:
+  `sentiment` is `positive`, `neutral` or `negative`, null when the article has no label for it, and
+  `sentiment_reasoning` is the provider's one-line reason. Labels for other tickers in the same article are
+  ignored. The label is the provider's model output, not a computation of this skill.
+- **Cleaning:** titles, publishers and reasons are third-party text. Only printable characters are kept
+  (control characters such as NUL become spaces), whitespace is collapsed, and the text is cut to
+  `NEWS_TEXT_CHARS` (300) characters with "…" (publishers to 80). A link is kept only when it is an http(s)
+  URL with a host, at most 500 characters, without spaces, quotes, angle brackets, backslashes or backticks;
+  otherwise `url` is null. An article without a title or a readable time is skipped, and one listed twice
+  (the same id, or the same title and time) counts once. Nothing in the text is interpreted or acted on.
+- **Output:** `n_articles` (the articles kept); `sentiment_counts` over all of them (`positive`, `neutral`,
+  `negative`, and `unlabeled` without a label for this ticker); `newest` and `oldest` (publication times);
+  `rows`, `NEWS_ROWS` (8) articles shown newest first, picked first from the newest articles tagged with at
+  most `NEWS_FOCUS_MAX_TICKERS` (3) tickers and only then from roundups tagged with more (a list of many
+  stocks says little about this one). `truncated` is true when the provider returned `NEWS_FETCH` articles:
+  the window may hold more than were read, and the counts then cover only the newest 50.
+- **Notes:** always "headlines and sentiment labels come from the news provider; they neither explain nor
+  forecast a price or IV move"; with no article, "no articles about {ticker} since {window_from}".
+- No module reads the headlines or the labels: they are context, never an input.
+
+---
+
+## 14. History store and snapshots (`scripts/history.py`, `scripts/snapshot.py`)
 
 ```
 $OA_DATA_DIR/                       default ~/options-data
@@ -422,14 +613,17 @@ $OA_DATA_DIR/                       default ~/options-data
   `cm_iv_30d_ex_event`, `ratio_30_90`, `rr25_30d`, `bf25_30d`, `straddle_30d_pct`, `pcr_volume`, `pcr_oi`,
   `total_oi`, `total_volume`, `net_gex_1pct`, `zero_gamma`, `contracts_live`, `feed_time`, `closed`,
   `late_feed` (feed at or after 20:15), `summary_version`. `analyze.py`, `snapshot.py` and
-  `--rebuild-summary` compute it with the same function, so the three always agree.
+  `--rebuild-summary` compute it with the same function, so the three agree whenever they read the same
+  inputs. A European index row is discounted with the Treasury curve of its cutoff date, two business days
+  earlier (days when both the NYSE and the Federal Reserve Board are open, section 2.1), when Massive is
+  configured, else at `DISCOUNT_RATE`.
 - VIX (futures-settled) is stored as a chain only, without a summary row.
 - **Schedule:** once per trading day between 16:30 and 20:00 New York (SPX, XSP and VIX options trade
   overnight from 20:15). A missed day cannot be recovered. A cloud or sandbox session keeps no history.
 
 ---
 
-## 14. Data-quality checks (`data_quality`)
+## 15. Data-quality checks (`data_quality`)
 
 | Check | Rule | Effect |
 |---|---|---|
@@ -441,18 +635,33 @@ $OA_DATA_DIR/                       default ~/options-data
 | Dropped expiries | no forward or no bracketing strikes | listed |
 | Previous close | the feed's `prev_day_close` rewritten after the close | `prev_close_rolled` |
 | Stale, intraday, overnight, no live quotes | section 1.4 | warning |
+| Exchange calendar `calendar_check` (Massive, both modes) | the exchange's holidays and early closes against `MARKET_HOLIDAYS` and `EARLY_CLOSES` | warning on any difference |
 
 The gamma check shows that CBOE's gamma is consistent with CBOE's IV; it does not prove the IV matches the
 quotes, which is why the ATM IV comes from the straddle.
 
+**Calendar check** (`data_quality.calendar_check`): Massive's `/v1/marketstatus/upcoming` lists the coming
+exchange holidays and early closes; the NYSE rows are read, early-close times converted to New York time. From
+the New York date of the run (`checked_from`) through the last date listed (`checked_through`; `n_dates` dates
+listed), every date whose status differs (`closed`, `early_close` or `open`), or whose early-close time differs,
+is a mismatch (the run's own date only when Massive lists it, since an "upcoming" list may leave out the current
+day; holiday names are cut to 80 printable characters): `data_quality.calendar_check.mismatches[*]` = {date, exchange, exchange_close, config,
+config_close, name}, the close times "HH:MM" New York or null (an unreadable close time is not a mismatch). Any
+mismatch adds the warning "the trading calendar in scripts/config.py differs from the exchange calendar on {n}
+date(s) ({dates}): update MARKET_HOLIDAYS and EARLY_CLOSES" (at most five dates named), because settlement
+times, sessions, staleness and trading-day counts read that calendar. The request is the last of a run and is
+sent only when a request slot is free at once (section 1.7); the calendar is then cached for a day. Without it
+the block is unavailable with the reason. `python scripts/massive_client.py check` prints the same comparison.
+
 ---
 
-## 15. Approximations
+## 16. Approximations
 
 | Item | Approximation | Why |
 |---|---|---|
 | Forward | median of K + C − P near the money (zero rates, no dividend model) | needs no rate or dividend inputs; accurate near the money; approximate for American options |
-| ATM IV | Black-76 inversion of the ATM straddle; European roots discounted at 4%, American roots undiscounted | matches the traded prices, unlike CBOE's short-dated SPX IVs; early exercise is ignored |
+| ATM IV | Black-76 inversion of the ATM straddle; European roots discounted with the Treasury curve of two business days earlier (Massive) or at 4%, American roots undiscounted | matches the traded prices, unlike CBOE's short-dated SPX IVs; early exercise is ignored |
+| Discount curve | Treasury par yields (bond-equivalent) as continuous rates 2 ln(1 + y/2), linear in T, flat beyond 1 month and 30 years; the curve of two business days before the data date (NYSE and Federal Reserve both open) | a recent risk-free curve, the same in every run of that day; a rate error Δr moves a European ATM IV by a factor of about e^(Δr · T) |
 | Wings and BF25 | CBOE's per-contract IVs, interpolated in delta | CBOE's model for American options and dividends is not published |
 | Constant-maturity IV | linear in total variance, calendar time; flat beyond the listed range | standard; weekends and holidays count as calendar days |
 | Dealer gamma | sign convention (customers sell calls, buy puts); sticky-strike profile; r = q = 0 | the feed shows no customer or dealer side |
@@ -466,7 +675,7 @@ quotes, which is why the ATM IV comes from the straddle.
 
 ---
 
-## 16. Chart and local UI
+## 17. Chart and local UI
 
 - `chart.html` is self-contained (inline CSS, JavaScript and data; no external URLs) and opens offline.
   The local UI (`ui/server.py`, 127.0.0.1 only) serves the same page for any symbol and the market view.
@@ -477,32 +686,37 @@ quotes, which is why the ATM IV comes from the straddle.
   volatilities, kinks and the earnings markers; the smile of the expiries nearest 7, 30 and 60 days plus
   E2 (|K/F − 1| ≤ 0.30); open interest and volume by strike (±25%) per window; GEX by strike and the gamma
   profile; past earnings reactions; the strategy candidates (up to `STRAT_CHART_ROWS` = 60 per screen); an
-  option-chain table (±20%); unusual activity.
+  option-chain table (±20%); unusual activity; with Massive, the short data and the headlines (third-party
+  text is shown as text, and a link only when it is http(s)). The data notes include the discount rate and the
+  calendar check.
 - Market page: KPIs; the thermometer; SPX term structure and GEX; the skew board; expected moves; PCR;
   VIX and VIX3M over the last 252 days; history sparklines once history exists.
 - The page text lives in `ui/i18n.js` (English in version 1; the structure takes another language).
 
 ---
 
-## 17. Output conventions and limitations
+## 18. Output conventions and limitations
 
 **`metrics.json`** (an internal format; it may change between versions).
 - Ticker top-level keys in order: `mode`, `ticker`, `as_of`, `quote_time`, `data_source`, `snapshot`,
   `data_quality`, `market_context`, `expected_move`, `term_structure`, `skew`, `volatility`, `earnings`,
-  `positioning`, `gamma`, `flow`, `strategies`, `history`, `meta`.
+  `positioning`, `gamma`, `flow`, `news`, `strategies`, `history`, `meta`.
 - Market: `mode`, `as_of`, `quote_time`, `data_source`, `snapshot`, `data_quality`, `vix`,
   `term_structure`, `skew_board`, `gamma_board`, `expected_moves`, `positioning`, `realized`,
   `thermometer`, `history`, `meta`.
-- **Units:** IVs, volatilities, percentages, skews and probabilities are fractions (0.25 = 25%).
-  Exceptions: volatility index levels are index points (VIX 18.5); `*_pctl`, `pctl_1y` and IV Rank are
-  0-100; prices are as quoted; dollar GEX is per 1% move.
+- **Units:** IVs, volatilities, percentages, skews, probabilities, yields and rates are fractions (0.25 =
+  25%). Exceptions: volatility index levels are index points (VIX 18.5); `*_pctl`, `pctl_1y` and IV Rank are
+  0-100; prices are as quoted; dollar GEX is per 1% move; short interest, short sale volumes and the free float
+  (`positioning.short`) are shares, while option volume and open interest (`positioning.total_volume`,
+  `positioning.total_oi`, `flow.rows[*].volume`) are contracts; `days_to_cover` is days.
 - **Values:** floats rounded to `METRICS_SIG_DIGITS` (6) significant digits; NaN and infinity are `null`;
-  dates `YYYY-MM-DD`; times New York ISO with offset.
+  dates `YYYY-MM-DD`; times New York ISO with offset, except the news times, which are UTC (`Z`).
 - **Text:** `notes`, `warnings` and `reason` are English. Fixed sentences also carry ids in the parallel
-  lists `note_ids` / `warning_ids` (and `reason_id`) for the UI.
-- **`meta`:** network calls and cache hits (CBOE + FMP), restricted endpoints, errors, skipped members,
-  `modules_unavailable` (every unavailable block with its reason), notes, the connection (never the key),
-  timings, versions, `config_snapshot` and the disclaimer.
+  lists `note_ids` / `warning_ids` (and `reason_id`) for the UI. News titles, publishers and reasons are
+  third-party text in the provider's words (section 13).
+- **`meta`:** network calls and cache hits (CBOE + FMP + Massive), restricted endpoints, errors, skipped
+  members and data pieces, `modules_unavailable` (every unavailable block with its reason), notes, the
+  connection (never the key), timings, versions, `config_snapshot` and the disclaimer.
 
 **Limitations.**
 1. About 15 minutes delayed, and only the current snapshot: history exists only where snapshots were
@@ -520,3 +734,8 @@ quotes, which is why the ATM IV comes from the straddle.
 9. Spreads are wider after the close; table prices are not executable quotes.
 10. The CBOE endpoint is unofficial: its address and format can change (the 2026-11 redirect is an
     example). Keep the request rate low; no commercial use or resale.
+11. Short interest is reported twice a month and published about a week after the settlement date; short
+    sale volume covers only trades reported to FINRA's facilities and includes market makers' hedges.
+12. Headlines and sentiment labels are the news provider's; this skill neither verifies nor uses them.
+13. Massive's free plan allows 5 requests a minute: a piece whose request would wait longer than
+    `MASSIVE_MAX_WAIT` is skipped (`meta.skipped`); a later run fetches it.

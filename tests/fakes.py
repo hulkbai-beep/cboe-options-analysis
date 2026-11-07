@@ -1,11 +1,13 @@
 """
-Offline stand-ins for CBOE and FMP (no network in any test).
+Offline stand-ins for CBOE, FMP and Massive (no network in any test).
 
 - FakeTransport: the urlopen of a real CboeClient; scripted responses per URL, or from_test_data() which serves
   the real fixtures (chains as gzip JSON, index CSVs, gzip 403 AccessDenied for anything else).
 - FakeCboe: the CboeClient interface over the fixtures (and a folder of synthetic chains); no cache, every call
   counts as one network call.
 - FakeFMP: the FMPClient interface over test-data/fmp, filtering daily bars by from/to like the real endpoint.
+- FakeMassive: the MassiveClient.results interface over synth.massive_data(), with Massive's filters (field.gte,
+  .lte, .gt, .lt), sort and limit; it can restrict paths, reject the key, be unreachable or rate limited.
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 import fmp_client
+import massive_client
 from cboe_client import NotFound, parse_index_csv
 
 ACCESS_DENIED = (b'<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>AccessDenied</Code>'
@@ -235,3 +238,57 @@ class FakeFMP:
 
     def calls_to(self, endpoint: str, symbol: str | None = None):
         return [p for e, p in self.requests if e == endpoint and (symbol is None or p.get("symbol") == symbol)]
+
+
+# ---------------------------------------------------------------------------- MassiveClient stand-in
+_OPS = {"gte": lambda a, b: a >= b, "lte": lambda a, b: a <= b, "gt": lambda a, b: a > b, "lt": lambda a, b: a < b}
+
+
+class FakeMassive:
+    """MassiveClient.results over a dict {(path, ticker or None): rows} (default synth.massive_data()). Records
+    every request as (path, params, wait) in .requests; each counts as one network call."""
+
+    def __init__(self, data=None, restricted=(), key_rejected=False, unreachable=False, rate_limited=(),
+                 base=massive_client.OFFICIAL_BASE):
+        if data is None:
+            import synth
+            data = synth.massive_data()
+        self.data = data
+        self.restricted, self.rate_limited = set(restricted), set(rate_limited)
+        self.key_rejected, self.unreachable = key_rejected, unreachable
+        self.base = base
+        self.stats = {"network_calls": 0, "cache_hits": 0}
+        self.requests: list[tuple[str, dict, object]] = []
+
+    def results(self, path, ttl=None, wait=None, **params):
+        self.stats["network_calls"] += 1
+        self.requests.append((path, dict(params), wait))
+        if self.unreachable:
+            raise massive_client.Unreachable("cannot reach api.massive.com: timed out")
+        if self.key_rejected:
+            raise massive_client.InvalidKey(f"key rejected on {path}: Unknown API Key")
+        if path in self.restricted:
+            raise massive_client.RestrictedEndpoint(f"{path}: not included in your plan (You are not entitled to "
+                                                    "this data)")
+        if path in self.rate_limited:
+            raise massive_client.RateLimited("Massive allows 5 requests a minute on this plan; the next free slot "
+                                             "is 40s away (longest wait 0s): run again in a minute")
+        rows = [dict(r) for r in self.data.get((path, params.get("ticker")), self.data.get((path, None), []))]
+        for k, v in params.items():
+            field, _, op = k.rpartition(".")
+            if field and op in _OPS:
+                rows = [r for r in rows if r.get(field) is not None and _OPS[op](str(r[field]), str(v))]
+        if params.get("sort"):
+            field, _, direction = str(params["sort"]).partition(".")
+            rows.sort(key=lambda r: str(r.get(field) or ""),
+                      reverse=(direction or params.get("order", "asc")) == "desc")
+        if params.get("limit"):
+            rows = rows[:int(params["limit"])]
+        return rows
+
+    def describe(self):
+        return {"route": "official Massive API", "base": self.base, "tls_verify": True, "tls_trust": "test",
+                "max_per_min": 5, "max_wait": 65.0}
+
+    def paths(self) -> list[str]:
+        return [p for p, _, _ in self.requests]

@@ -17,7 +17,7 @@ def run(synth_data, root, *args, transform=None, fmp=None, **fmp_kwargs):
     cboe, fake_fmp = fakes_for(synth_data, **fmp_kwargs)
     cboe.transform = transform
     code = snapshot.main([*args, "--data-dir", str(root), "--sleep", "0"], cboe=cboe,
-                         fmp=fake_fmp if fmp is None else fmp)
+                         fmp=fake_fmp if fmp is None else fmp, massive=fetch.MassiveState(None))
     return code, cboe
 
 

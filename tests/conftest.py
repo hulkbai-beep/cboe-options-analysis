@@ -35,6 +35,20 @@ def real_data() -> Path:
     return p
 
 
+@pytest.fixture(scope="session", autouse=True)
+def no_massive_key(tmp_path_factory):
+    """No test reaches Massive through the environment: MASSIVE_API_KEY is removed (the cloud environment and a
+    machine that ran `setx MASSIVE_API_KEY` have one), the Windows registry is not read and the Massive cache is a
+    temporary folder; a test that wants Massive passes a fake client. Session-scoped and autouse, so it is in place
+    before every session and module fixture that runs an analysis."""
+    import winenv
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("MASSIVE_API_KEY", raising=False)
+        mp.setenv("MASSIVE_CACHE_DIR", str(tmp_path_factory.mktemp("massive_cache")))
+        mp.setattr(winenv, "load_user_env", lambda names=None: [])
+        yield
+
+
 @pytest.fixture
 def no_network(monkeypatch):
     def refuse(*a, **k):
@@ -67,8 +81,9 @@ def synth_data(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session")
 def synth_run(synth_data, tmp_path_factory):
     """run(ticker or "MARKET", **FakeFMP options) -> (metrics, chart_data) on the synthetic data, computed once per
-    combination; every run gets its own empty history store."""
+    combination, without Massive; every run gets its own empty history store."""
     import analyze
+    import fetch
     done = {}
 
     def run(ticker: str, **fmp_kwargs):
@@ -76,10 +91,11 @@ def synth_run(synth_data, tmp_path_factory):
         if key not in done:
             cboe, fmp = fakes_for(synth_data, **fmp_kwargs)
             store = tmp_path_factory.mktemp("history")
+            ms = fetch.MassiveState(None)                      # Massive not configured, whatever the environment
             if ticker == "MARKET":
-                done[key] = analyze.run_market(client=cboe, fmp=fmp, now=NOW, data_dir=store)
+                done[key] = analyze.run_market(client=cboe, fmp=fmp, now=NOW, data_dir=store, massive=ms)
             else:
-                done[key] = analyze.run_analysis(ticker, client=cboe, fmp=fmp, now=NOW, data_dir=store)
+                done[key] = analyze.run_analysis(ticker, client=cboe, fmp=fmp, now=NOW, data_dir=store, massive=ms)
         return done[key]
     return run
 

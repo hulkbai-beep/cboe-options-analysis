@@ -8,8 +8,11 @@ import pytest
 import analyze
 import config as C
 import fetch
+import massive_client as MC
+import synth
 from cboe_client import CboeUnreachable
 from conftest import NOW, fakes_for
+from fakes import FakeMassive
 from symbols import SymbolRejected
 
 TICKERS = ("ACME", "SPY", "SPX", "NDX", "XSP")
@@ -18,7 +21,8 @@ ENUM_FIELDS = {"shape": "shape_", "band": "band_", "applicability": "applic_", "
                "liquidity": "liq_", "kind_source": "ksrc_", "timing": "timing_", "spot_basis": "basis_",
                "method": "method_", "date_check": "date_check_", "window_label": "window_", "settlement": "settle_",
                "exercise_style": "style_", "atm_iv_source": "ivsrc_", "iv30_change_source": "iv30src_",
-               "evidence": "evidence_", "reason_id": "reason_", "tags": "tag_"}
+               "evidence": "evidence_", "reason_id": "reason_", "tags": "tag_", "sentiment": "sent_",
+               "dividends_source": "divsrc_"}
 
 
 def walk(obj, path=""):
@@ -42,6 +46,33 @@ def all_runs(synth_run):
     return {t: synth_run(t)[0] for t in TICKERS + ("MARKET",)}
 
 
+@pytest.fixture(scope="module")
+def massive_runs(synth_data, tmp_path_factory):
+    """Runs with fakes.FakeMassive: the Massive blocks of a stock and an ETF, dividends from Massive without FMP, and
+    an index with the Treasury curve restricted and one more NYSE closure than config.py knows."""
+    extra = synth.massive_data()
+    extra[(MC.HOLIDAYS, None)] = synth.holiday_rows() + [
+        {"date": "2026-12-31", "exchange": "NYSE", "name": "Extra closure", "status": "closed"}]
+    out = {}
+    for name, ticker, fmp, kw in (("ACME+Massive", "ACME", True, {}), ("ACME+Massive-FMP", "ACME", False, {}),
+                                  ("SPY+Massive", "SPY", True, {}),
+                                  ("SPX+Massive", "SPX", True, {"data": extra, "restricted": (MC.TREASURY,)}),
+                                  ("MARKET+Massive", "MARKET", True, {})):
+        cboe, fake_fmp = fakes_for(synth_data)
+        fs, store = fake_fmp if fmp else fetch.FmpState(None), tmp_path_factory.mktemp("history")
+        if ticker == "MARKET":
+            out[name], _ = analyze.run_market(client=cboe, fmp=fs, now=NOW, data_dir=store, massive=FakeMassive(**kw))
+        else:
+            out[name], _ = analyze.run_analysis(ticker, client=cboe, fmp=fs, now=NOW, data_dir=store,
+                                                massive=FakeMassive(**kw))
+    ids = {n: [i["id"] for _, d in walk(m) for i in (d.get("note_ids") or []) + (d.get("warning_ids") or []) if i]
+           for n, m in out.items()}
+    assert "dividends_massive" in ids["ACME+Massive-FMP"]                 # the runs reach the new sentences
+    assert {"rates_fixed", "calendar_mismatch"} <= set(ids["SPX+Massive"])
+    assert {"news_third_party", "short_interest_lag", "short_volume_mm"} <= set(ids["ACME+Massive"])
+    return out
+
+
 # ---------------------------------------------------------------------------- shape of metrics.json
 def test_key_order_and_strict_json(ticker_run):
     t, m = ticker_run
@@ -53,7 +84,7 @@ def test_key_order_and_strict_json(ticker_run):
 
 def test_modules_say_why_they_are_unavailable(all_runs):
     for name, m in all_runs.items():
-        keys = analyze.MARKET_KEYS[6:15] if name == "MARKET" else analyze.TICKER_KEYS[7:18]
+        keys = analyze.MARKET_MODULES if name == "MARKET" else analyze.TICKER_MODULES
         for k in keys:
             assert isinstance(m[k].get("available"), bool), (name, k)
         for path, d in walk(m):
@@ -74,8 +105,8 @@ def test_times_are_iso_with_an_offset(all_runs):
                 assert ISO.match(r["last_trade_time"])
 
 
-def test_fixed_sentences_match_their_ids(all_runs):
-    for name, m in all_runs.items():
+def test_fixed_sentences_match_their_ids(all_runs, massive_runs):
+    for name, m in {**all_runs, **massive_runs}.items():
         for path, d in walk(m):
             for text_key, id_key, table, prefix in (("notes", "note_ids", C.NOTES, "note_"),
                                                      ("warnings", "warning_ids", C.WARNINGS, "warn_")):
@@ -91,8 +122,8 @@ def test_fixed_sentences_match_their_ids(all_runs):
                     assert text == (f"{nid['key']}: {want}" if nid.get("key") else want), (name, path)
 
 
-def test_enumerated_values(all_runs):
-    for name, m in all_runs.items():
+def test_enumerated_values(all_runs, massive_runs):
+    for name, m in {**all_runs, **massive_runs}.items():
         for path, d in walk(m):
             for field, prefix in ENUM_FIELDS.items():
                 v = d.get(field)
@@ -100,7 +131,7 @@ def test_enumerated_values(all_runs):
                     assert v in C.ENUMS[prefix], (name, path, field, v)
                 elif field == "tags" and isinstance(v, list):
                     assert set(v) <= set(C.ENUMS[prefix]), (name, path, v)
-        if name == "MARKET":
+        if m["mode"] == "market":
             assert m["thermometer"]["label"] in C.ENUMS["thermo_"]
             assert tuple(m["thermometer"]["flags"]) == C.THERMO_FLAGS
             assert all(r["label"] in C.ENUMS["skew_"] for r in m["skew_board"]["rows"])
@@ -199,9 +230,9 @@ def test_history_saves_once(synth_data, tmp_path):
 # ---------------------------------------------------------------------------- command line
 @pytest.fixture
 def cli(synth_data, monkeypatch, tmp_path):
-    def clients(client, fmp, refresh):
+    def clients(client, fmp, refresh, massive=None):
         cboe, f = fakes_for(synth_data)
-        return cboe, fetch.FmpState(f)
+        return cboe, fetch.FmpState(f), fetch.MassiveState(None)
 
     monkeypatch.setattr(analyze, "_clients", clients)
     monkeypatch.chdir(tmp_path)
@@ -239,7 +270,8 @@ def test_cli_never_prints_the_key(cli, capsys, monkeypatch):
         def get_chain(self, symbol):
             raise CboeUnreachable(f"cannot reach the feed (url had apikey={secret})")
 
-    monkeypatch.setattr(analyze, "_clients", lambda c, f, r: (Down(), fetch.FmpState(None)))
+    monkeypatch.setattr(analyze, "_clients", lambda c, f, r, m=None: (Down(), fetch.FmpState(None),
+                                                                      fetch.MassiveState(None)))
     assert analyze.main(["SPY"]) == 1
     err = capsys.readouterr().err
     assert secret not in err and "apikey=***" in err

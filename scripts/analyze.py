@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Options analysis of one US stock, ETF or index from CBOE's delayed option chain (plus optional FMP data), or the
-market risk thermometer: writes metrics.json (every computed number) and a self-contained chart.html.
+Options analysis of one US stock, ETF or index from CBOE's delayed option chain (plus optional FMP and Massive
+data), or the market risk thermometer: writes metrics.json (every computed number) and a self-contained chart.html.
 
   python scripts/analyze.py TICKER [--out DIR] [--data-dir DIR] [--refresh] [--no-save] [--no-market-context]
   python scripts/analyze.py --market [--out DIR] [--data-dir DIR] [--refresh] [--no-save]
@@ -9,11 +9,11 @@ market risk thermometer: writes metrics.json (every computed number) and a self-
   --market             the market view (SPX, SPY, QQQ, IWM, VIX) instead of one ticker
   --out                output folder (default ./oa-output/<TICKER>_<as_of>/ or ./oa-output/MARKET_<as_of>/)
   --data-dir           history store (default $OA_DATA_DIR, else ~/options-data)
-  --refresh            ignore the CBOE and FMP caches and fetch again
+  --refresh            ignore the CBOE, FMP and Massive caches and fetch again
   --no-save            do not store today's chain and summary row in the history store
   --no-market-context  skip the SPX / VIX market context (two fewer CBOE requests)
 
-Exit codes: 0 done (also when FMP is unavailable); 1 the analysis could not run (unknown symbol, CBOE
+Exit codes: 0 done (also when FMP or Massive is unavailable); 1 the analysis could not run (unknown symbol, CBOE
 unreachable, no live contracts, VIX refused in ticker mode); 2 usage problem (bad arguments).
 The report (report.md) is written by Claude from metrics.json with references/report_template.md or
 references/market_template.md. No API key is ever printed.
@@ -51,10 +51,13 @@ from symbols import SymbolRejected, normalize
 
 TICKER_KEYS = ("mode", "ticker", "as_of", "quote_time", "data_source", "snapshot", "data_quality", "market_context",
                "expected_move", "term_structure", "skew", "volatility", "earnings", "positioning", "gamma", "flow",
-               "strategies", "history", "meta")
+               "news", "strategies", "history", "meta")
 MARKET_KEYS = ("mode", "as_of", "quote_time", "data_source", "snapshot", "data_quality", "vix", "term_structure",
                "skew_board", "gamma_board", "expected_moves", "positioning", "realized", "thermometer", "history",
                "meta")
+# the module blocks of each mode (between data_quality and meta): meta.modules_unavailable reads these
+TICKER_MODULES = TICKER_KEYS[TICKER_KEYS.index("market_context"):TICKER_KEYS.index("meta")]
+MARKET_MODULES = MARKET_KEYS[MARKET_KEYS.index("vix"):MARKET_KEYS.index("meta")]
 # ticker-mode builders after the earnings date is known, in the fixed order of plan 3.4 (market_context separate)
 MODULE_ORDER = (
     ("term_structure", M.build_term_structure),
@@ -65,10 +68,17 @@ MODULE_ORDER = (
     ("positioning", M.build_positioning),
     ("gamma", M.build_gamma),
     ("flow", M.build_flow),
+    ("news", M.build_news),
 )
 SCRIPTS_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPTS_DIR.parent
 CBOE_SOURCE = "CBOE delayed quotes (~15 min)"
+MASSIVE_SOURCE = "Massive API"
+# ctx key -> load_all key: the Massive rows the module builders read
+MASSIVE_CTX = {"short_interest_rows": "short_interest", "short_interest_reason": "short_interest_reason",
+               "short_volume_rows": "short_volume", "short_volume_reason": "short_volume_reason",
+               "float_rows": "float", "float_reason": "float_reason", "news_rows": "news",
+               "news_reason": "news_reason", "news_from": "news_from"}
 
 
 # ---------------------------------------------------------------------------- JSON
@@ -130,9 +140,11 @@ def fmp_data_source(connection: dict | None) -> str | None:
     return f"FMP stable API via third-party proxy {host}"
 
 
-def data_source(fmp_connection: dict | None) -> str:
+def data_source(fmp_connection: dict | None, massive_connection: dict | None = None) -> str:
+    """CBOE, then FMP's route (or "; FMP not configured"); " + Massive API" only when Massive is configured."""
     src = fmp_data_source(fmp_connection)
-    return f"{CBOE_SOURCE} + {src}" if src else f"{CBOE_SOURCE}; FMP not configured"
+    extra = f" + {MASSIVE_SOURCE}" if massive_connection else ""
+    return f"{CBOE_SOURCE} + {src}{extra}" if src else f"{CBOE_SOURCE}{extra}; FMP not configured"
 
 
 def config_snapshot() -> dict:
@@ -197,7 +209,8 @@ def _versions() -> dict:
     return {"python": platform.python_version(), "pandas": pd.__version__, "numpy": np.__version__}
 
 
-def _clients(client, fmp, refresh: bool):
+def _clients(client, fmp, refresh: bool, massive=None):
+    """(CBOE client, FmpState, MassiveState): the given clients, else ones made from the environment."""
     cboe = client if client is not None else CboeClient(refresh=refresh)
     if isinstance(fmp, fetch.FmpState):
         fs = fmp
@@ -205,30 +218,61 @@ def _clients(client, fmp, refresh: bool):
         fs = fetch.FmpState(fmp)
     else:
         fs = fetch.FmpState(*fetch.make_fmp(refresh))
-    return cboe, fs
+    if isinstance(massive, fetch.MassiveState):
+        ms = massive
+    elif massive is not None:
+        ms = fetch.MassiveState(massive)
+    else:
+        ms = fetch.MassiveState(*fetch.make_massive(refresh))
+    return cboe, fs, ms
 
 
-def _meta(cboe, fs, calls0, started, errors, mods, notes, skipped, fetched_at) -> dict:
+def _meta(cboe, fs, ms, calls0, started, errors, mods, notes, skipped, fetched_at) -> dict:
     cb_calls = int(cboe.stats["network_calls"]) - calls0[0]
     cb_hits = int(cboe.stats["cache_hits"]) - calls0[1]
     f_calls, f_hits = fs.calls()
     f_calls, f_hits = f_calls - calls0[2], f_hits - calls0[3]
+    m_calls, m_hits = ms.calls()
+    m_calls, m_hits = m_calls - calls0[4], m_hits - calls0[5]
     cdesc = cboe.describe() if hasattr(cboe, "describe") else {"source": "CBOE delayed quotes"}
-    fdesc = fs.describe()
+    fdesc, mdesc = fs.describe(), ms.describe()
     return {
-        "network_calls": cb_calls + f_calls, "cache_hits": cb_hits + f_hits,
-        "restricted": list(fs.restricted), "errors": list(errors), "skipped": dict(skipped),
-        "modules_unavailable": _unavailable(mods), "notes": list(notes) + list(fs.notes),
+        "network_calls": cb_calls + f_calls + m_calls, "cache_hits": cb_hits + f_hits + m_hits,
+        "restricted": list(fs.restricted) + list(ms.restricted), "errors": list(errors), "skipped": dict(skipped),
+        "modules_unavailable": _unavailable(mods), "notes": list(notes) + list(fs.notes) + list(ms.notes),
         "connection": {"cboe": {**{k: cdesc.get(k) for k in ("source", "base", "redirected_to")}, "calls": cb_calls},
                        "fmp": ({"route": fdesc.get("route"), "base": fdesc.get("base"),
-                                "tls_verify": fdesc.get("tls_verify"), "calls": f_calls} if fdesc else None)},
+                                "tls_verify": fdesc.get("tls_verify"), "calls": f_calls} if fdesc else None),
+                       "massive": ({"route": mdesc.get("route"), "base": mdesc.get("base"),
+                                    "tls_verify": mdesc.get("tls_verify"), "calls": m_calls} if mdesc else None)},
         "fetched_at": fetched_at, "generated_at": _iso_now(), "runtime_seconds": round(time.time() - started, 2),
         "versions": _versions(), "config_snapshot": config_snapshot(), "disclaimer": C.DISCLAIMER,
     }
 
 
-def _calls0(cboe, fs) -> tuple:
-    return (int(cboe.stats["network_calls"]), int(cboe.stats["cache_hits"])) + fs.calls()
+def _calls0(cboe, fs, ms) -> tuple:
+    return (int(cboe.stats["network_calls"]), int(cboe.stats["cache_hits"])) + fs.calls() + ms.calls()
+
+
+def _today_ny(now) -> dt.date:
+    return CH.to_ny(now).date()
+
+
+def _massive_skipped(data: dict, ms, discounted: bool) -> dict:
+    """meta.skipped entries for the Massive pieces a configured Massive did not deliver (`discounted`: European
+    straddles in this run, of the ticker or of the market context's SPX)."""
+    if not ms.configured:
+        return {}
+    out = {}
+    if data["sym"]["kind"] != "index":
+        for name in ("short_interest", "short_volume", "news") + (("float",) if data["sym"]["kind"] == "stock" else ()):
+            if data.get(name) is None and data.get(f"{name}_reason"):
+                out[name] = data[f"{name}_reason"]
+    if data.get("rates") is None and discounted and data.get("rates_reason"):
+        out["treasury_curve"] = data["rates_reason"]
+    if data.get("holidays") is None and data.get("holidays_reason"):
+        out["calendar_check"] = data["holidays_reason"]
+    return out
 
 
 def _fetched_at(cboe, symbol: str) -> str | None:
@@ -274,7 +318,7 @@ def _market_context(data: dict, ctx: dict, errors: list) -> tuple[dict, dict | N
         spx_ctx = ctx
     elif mk.get("spx_payload") is not None:
         try:
-            spx_ctx = MK.member("SPX", "index", mk["spx_payload"])
+            spx_ctx = MK.member("SPX", "index", mk["spx_payload"], rates=data.get("rates"))
         except Exception as e:  # the market context is optional
             spx_reason = f"SPX computation failed: {type(e).__name__}: {e}"
             errors.append(f"market_context: {spx_reason}")
@@ -284,25 +328,27 @@ def _market_context(data: dict, ctx: dict, errors: list) -> tuple[dict, dict | N
 
 
 def run_analysis(ticker: str, client=None, fmp=None, now=None, refresh: bool = False, save: bool = True,
-                 market_context: bool = True, data_dir=None) -> tuple[dict, dict | None]:
-    """Fetch, compute every module and return (metrics, chart_data) for one ticker (plan 3.4).
+                 market_context: bool = True, data_dir=None, massive=None) -> tuple[dict, dict | None]:
+    """Fetch, compute every module and return (metrics, chart_data) for one ticker (plan 3.4). `client`, `fmp` and
+    `massive` default to clients made from the environment (FMP and Massive are optional).
     Raises SymbolRejected / ValueError (bad symbol, VIX, no live contracts) and CboeError (NotFound, CboeUnreachable)."""
     normalize(ticker)                                     # refuse VIX / DJX / foreign listings before any request
     started = time.time()
-    cboe, fs = _clients(client, fmp, refresh)
-    calls0 = _calls0(cboe, fs)
-    data = fetch.load_all(ticker, cboe, fs, now=now, market_context=market_context)
+    cboe, fs, ms = _clients(client, fmp, refresh, massive)
+    calls0 = _calls0(cboe, fs, ms)
+    data = fetch.load_all(ticker, cboe, fs, now=now, market_context=market_context, ms=ms)
     sym, session, frame = data["sym"], data["session"], data["frame"]
     key, kind = data["key"], sym["kind"]
     as_of = session["as_of"]
     earn_date = M.next_earnings(data["earnings_rows"], as_of, session["closed"]) if kind == "stock" else None
-    ctx = core.chain_context(key, kind, session, frame, earn_date)
+    ctx = core.chain_context(key, kind, session, frame, earn_date, rates=data["rates"])
     if ctx["info"]["contracts_live"] == 0:
         raise ValueError(f"no live contracts in the {sym['cboe']} chain (as of {as_of})")
     root = H.data_dir(data_dir)
     view = H.HistoryView(root, key, as_of)
-    ctx.update({k: data[k] for k in ("earnings_rows", "dividends", "bars", "bars_source", "bars_proxy",
-                                     "iv_index", "iv_index_symbol", "iv_index_reason")})
+    ctx.update({k: data[k] for k in ("earnings_rows", "dividends", "dividends_source", "dividends_reason", "bars",
+                                     "bars_source", "bars_proxy", "iv_index", "iv_index_symbol", "iv_index_reason")})
+    ctx.update({k: data[v] for k, v in MASSIVE_CTX.items()})
     ctx["earnings_reason"] = data.get("earnings_reason") if kind == "stock" else None
     if kind == "stock" and earn_date is None and data.get("earnings_rows"):
         ctx["earnings_reason"] = "no upcoming earnings date from FMP"
@@ -312,6 +358,8 @@ def run_analysis(ticker: str, client=None, fmp=None, now=None, refresh: bool = F
     mods = ctx["mods"]
     for name, fn in MODULE_ORDER:
         mods[name] = _safe(name, fn, errors, ctx)
+    if isinstance(mods.get("positioning"), dict):
+        mods["positioning"]["short"] = _safe("positioning.short", M.build_short, errors, ctx)
     res = _safe("market_context", _market_context, errors, data, ctx, errors)
     mods["market_context"], ctx["spx_ctx"] = res if isinstance(res, tuple) else (res, None)
 
@@ -335,15 +383,20 @@ def run_analysis(ticker: str, client=None, fmp=None, now=None, refresh: bool = F
     hist = H.history_block(root, key, view2, saved, row)
 
     dq = Q.data_quality(ctx, now)
+    Q.calendar_check(dq, data.get("holidays"), data.get("holidays_reason"), _today_ny(now))
+    european = bool(ctx["sf"]["european"].any()) if len(ctx["sf"]) else False
     metrics = {
         "mode": "ticker", "ticker": key, "as_of": as_of, "quote_time": CH.iso(session["feed_time"]),
-        "data_source": data_source(fs.describe()), "snapshot": _snapshot(ctx, data, view), "data_quality": dq,
-        "market_context": mods["market_context"], **{k: mods[k] for k in ("expected_move", "term_structure", "skew",
-                                                                         "volatility", "earnings", "positioning",
-                                                                         "gamma", "flow", "strategies")},
+        "data_source": data_source(fs.describe(), ms.describe()), "snapshot": _snapshot(ctx, data, view),
+        "data_quality": dq, "market_context": mods["market_context"],
+        **{k: mods[k] for k in ("expected_move", "term_structure", "skew", "volatility", "earnings", "positioning",
+                                "gamma", "flow", "news", "strategies")},
         "history": hist,
     }
     snap = metrics["snapshot"]
+    discounted = european or ctx.get("spx_ctx") is not None      # this chain, or the SPX of the market context
+    curve, why = (data["rates"], data["rates_reason"]) if discounted else (None, fetch.RATES_NOT_NEEDED)
+    snap["rates"] = fetch.rates_block(curve, why, european)
     snap["notes"], snap["note_ids"] = [], []
     for n, nid in zip(data["notes"], data["note_ids"]):
         if nid:
@@ -353,14 +406,15 @@ def run_analysis(ticker: str, client=None, fmp=None, now=None, refresh: bool = F
     skipped = {}
     if data.get("fmp_profile_reason") and kind != "index":
         skipped["profile"] = data["fmp_profile_reason"]
-    if kind in ("stock", "etf") and data.get("dividends_reason"):
+    if kind in ("stock", "etf") and data.get("dividends_reason") and data.get("dividends_source") != "massive":
         skipped["dividends"] = data["dividends_reason"]
     if data.get("bars_reason"):
         skipped["daily_bars"] = data["bars_reason"]
     if kind == "stock" and data.get("earnings_reason") and not data.get("earnings_rows"):
         skipped["earnings"] = data["earnings_reason"]
+    skipped.update(_massive_skipped(data, ms, discounted))
     chart_data = None
-    metrics["meta"] = _meta(cboe, fs, calls0, started, errors, {k: metrics[k] for k in TICKER_KEYS[7:18]},
+    metrics["meta"] = _meta(cboe, fs, ms, calls0, started, errors, {k: metrics[k] for k in TICKER_MODULES},
                             [], skipped, _fetched_at(cboe, sym["cboe"]))
     metrics = pair_ids(metrics)
     try:
@@ -376,17 +430,20 @@ def run_analysis(ticker: str, client=None, fmp=None, now=None, refresh: bool = F
 
 # ---------------------------------------------------------------------------- market mode
 def run_market(client=None, fmp=None, now=None, refresh: bool = False, save: bool = True, universe=None,
-               data_dir=None) -> tuple[dict, dict | None]:
+               data_dir=None, massive=None) -> tuple[dict, dict | None]:
     """The market view (plan 7). Raises the CboeError of _SPX when SPX is unavailable."""
     started = time.time()
-    cboe, fs = _clients(client, fmp, refresh)
-    calls0 = _calls0(cboe, fs)
+    cboe, fs, ms = _clients(client, fmp, refresh, massive)
+    calls0 = _calls0(cboe, fs, ms)
     universe = tuple(universe or C.MARKET_UNIVERSE)
     errors: list[str] = []
     skipped: dict = {}
     members: dict = {}
     payloads: dict = {}
     spx_payload = cboe.get_chain("_SPX")                  # SPX is required: its CboeError ends the run (exit 1)
+    rates, rates_reason = fetch.load_rates(ms, CH.session_from_payload(spx_payload)["as_of"])
+    if rates is None and ms.configured:
+        skipped["treasury_curve"] = rates_reason
     for cboe_sym, kind in universe:
         key = cboe_sym.lstrip("_")
         try:
@@ -397,7 +454,7 @@ def run_market(client=None, fmp=None, now=None, refresh: bool = False, save: boo
             continue
         payloads[key] = payload
         try:
-            members[key] = MK.member(key, kind, payload)
+            members[key] = MK.member(key, kind, payload, rates=rates)
         except Exception as e:  # one member must not stop the others
             msg = f"{key}: {type(e).__name__}: {e}"
             errors.append(msg)
@@ -478,6 +535,10 @@ def run_market(client=None, fmp=None, now=None, refresh: bool = False, save: boo
         for w, wid in zip(q["warnings"], q["warning_ids"]):
             dq["warnings"].append(f"{k}: {w}")
             dq["warning_ids"].append({**wid, "key": k} if wid else None)
+    holidays, holidays_reason = ms.results(fetch.MC.HOLIDAYS, wait=0)     # last: only when a slot is free at once
+    Q.calendar_check(dq, holidays, holidays_reason, _today_ny(now))
+    if holidays is None and ms.configured:
+        skipped["calendar_check"] = holidays_reason
 
     # history: chains for every available member (VIX chain only), summary rows except VIX
     saved_keys, hist_days = [], {}
@@ -517,15 +578,16 @@ def run_market(client=None, fmp=None, now=None, refresh: bool = False, save: boo
                                   "spot": None, "spot_basis": None, "feed_time": None, "overnight_quotes": None})
     metrics = {
         "mode": "market", "as_of": as_of, "quote_time": CH.iso(s_spx["feed_time"]),
-        "data_source": data_source(fs.describe()),
-        "snapshot": {"as_of": as_of, "feed_time": CH.iso(s_spx["feed_time"]), "universe": universe_rows},
+        "data_source": data_source(fs.describe(), ms.describe()),
+        "snapshot": {"as_of": as_of, "feed_time": CH.iso(s_spx["feed_time"]), "universe": universe_rows,
+                     "rates": fetch.rates_block(rates, rates_reason, True)},
         "data_quality": dq, "vix": vix, "term_structure": ts,
         "skew_board": M.block(rows=skew_rows), "gamma_board": M.block(rows=gamma_rows),
         "expected_moves": M.block(rows=em_rows), "positioning": M.block(rows=pcr_rows), "realized": realized,
         "thermometer": thermo, "history": hist,
     }
-    mods = {k: metrics[k] for k in MARKET_KEYS[6:15]}
-    metrics["meta"] = _meta(cboe, fs, calls0, started, errors, mods, [], skipped, _fetched_at(cboe, "_SPX"))
+    mods = {k: metrics[k] for k in MARKET_MODULES}
+    metrics["meta"] = _meta(cboe, fs, ms, calls0, started, errors, mods, [], skipped, _fetched_at(cboe, "_SPX"))
     metrics = pair_ids(metrics)
     chart_data = None
     try:
@@ -586,6 +648,27 @@ def _line(label: str, text: str) -> str:
     return f"  {label:<13}: {text}"
 
 
+def _massive_lines(m: dict) -> list[str]:
+    """Summary lines for the Massive blocks of a ticker run that arrived (short data, news)."""
+    lines = []
+    short = (m.get("positioning") or {}).get("short") or {}
+    si, sv = short.get("interest") or {}, short.get("volume") or {}
+    if si.get("available") and si.get("short_interest") is not None:
+        pf = f", {_pct(si['pct_float'])} of the free float" if si.get("pct_float") is not None else ""
+        lines.append(_line("short", f"{si['short_interest']:,.0f} shares{pf}, {_num(si.get('days_to_cover'), 1)} "
+                                    f"days to cover ({si.get('settlement_date')})"))
+    if sv.get("available"):
+        lines.append(_line("short volume", f"{_pct(sv.get('ratio'))} of FINRA volume on {sv.get('date')}, "
+                                           f"{sv.get('days')}-day average {_pct(sv.get('avg_ratio'))}"))
+    news = m.get("news") or {}
+    if news.get("available"):
+        c = news.get("sentiment_counts") or {}
+        lines.append(_line("news", f"{news.get('n_articles')} articles in {news.get('window_days')} days; provider "
+                                   f"labels: {c.get('positive', 0)} positive, {c.get('neutral', 0)} neutral, "
+                                   f"{c.get('negative', 0)} negative, {c.get('unlabeled', 0)} unlabeled"))
+    return lines
+
+
 def summary(metrics: dict, paths: dict) -> str:
     """Short plain-text summary of a run for the terminal (English only)."""
     m, meta = metrics, metrics["meta"]
@@ -642,6 +725,7 @@ def summary(metrics: dict, paths: dict) -> str:
         gm = m["gamma"]
         lines.append(_line("gamma", f"{gm.get('regime') or 'n/a'}, zero gamma "
                            f"{gm['zero_gamma']:.2f}" if gm.get("zero_gamma") else f"{gm.get('regime') or 'n/a'}"))
+        lines += _massive_lines(m)
     lines.append(_line("API calls", f"{meta['network_calls']} network, {meta['cache_hits']} from cache"))
     for w in m["data_quality"].get("warnings") or []:
         lines.append(_line("WARNING", w))
@@ -651,17 +735,21 @@ def summary(metrics: dict, paths: dict) -> str:
 
 
 def _redact(text: str) -> str:
-    key = os.environ.get("FMP_API_KEY", "").strip()
-    return text.replace(key, "***") if key else text
+    for name in ("FMP_API_KEY", "MASSIVE_API_KEY"):
+        key = os.environ.get(name, "").strip()
+        if key:
+            text = text.replace(key, "***")
+    return text
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Options analysis from CBOE's delayed option chains (FMP optional).")
+    ap = argparse.ArgumentParser(description="Options analysis from CBOE's delayed option chains (FMP and Massive "
+                                             "optional).")
     ap.add_argument("ticker", nargs="?", help="e.g. NVDA, SPY, SPX, BRK.B (not VIX: use --market)")
     ap.add_argument("--market", action="store_true", help="the market view (SPX, SPY, QQQ, IWM, VIX)")
     ap.add_argument("--out", help="output folder (default ./oa-output/<TICKER>_<as_of>/)")
     ap.add_argument("--data-dir", help="history store (default $OA_DATA_DIR, else ~/options-data)")
-    ap.add_argument("--refresh", action="store_true", help="ignore the CBOE and FMP caches and fetch again")
+    ap.add_argument("--refresh", action="store_true", help="ignore the CBOE, FMP and Massive caches and fetch again")
     ap.add_argument("--no-save", action="store_true", help="do not store today's chain and summary row")
     ap.add_argument("--no-market-context", action="store_true", help="skip the SPX / VIX market context")
     return ap

@@ -1,10 +1,12 @@
 """
 The per-expiry volatility surface (plan 5.1) and the helpers built on it.
 
-build(session, x) -> one row per surface expiry (the preferred root of each expiry):
+build(session, x, rates=None) -> one row per surface expiry (the preferred root of each expiry):
   expiration, root, settlement, european, dte, T, forward, bracket_ok, atm_strike, straddle, straddle_pct,
   atm_iv (backed out of the ATM straddle with Black-76), atm_iv_source, atm_iv_cboe, move_1sd_pct,
-  put25_iv, call25_iv, rr25 (= put25 - call25), bf25, drop_reason.
+  put25_iv, call25_iv, rr25 (= put25 - call25), bf25, drop_reason. European (cash-settled) straddles are discounted
+  with `rates` (a RateCurve from the Treasury yields) or, without one, at the fixed DISCOUNT_RATE.
+RateCurve: continuously compounded rates by maturity from a Treasury curve (Massive), flat beyond the ends.
 apply_overnight_spot(session, sf): overnight (GTH) quotes -> spot = forward of the first expiry with dte >= 1.
 interp_in_t(): constant-maturity interpolation (total variance or linear in T, flat beyond the ends).
 kink_expiries(), event_expiries() (E1, E2, E3 of plan 5.6), key_expiries() (the tags of plan 5.2).
@@ -28,6 +30,50 @@ DROP_NO_BRACKET = "no strikes bracketing the forward (partial listing)"
 
 def n_cdf(v: float) -> float:
     return 0.5 * (1.0 + math.erf(v / math.sqrt(2.0)))
+
+
+# ---------------------------------------------------------------------------- discount rates
+class RateCurve:
+    """Discount rates by maturity: the Treasury constant-maturity yields of one day (bond-equivalent, percent)
+    turned into continuously compounded rates r = 2 ln(1 + y/2), linear in T between the maturities and flat
+    beyond the first and the last."""
+
+    def __init__(self, points, curve_date: date | None = None, yields: dict | None = None):
+        pts = sorted((float(t), float(r)) for t, r in points)
+        if not pts:
+            raise ValueError("a rate curve needs at least one point")
+        self.t = np.array([p[0] for p in pts])
+        self.r = np.array([p[1] for p in pts])
+        self.curve_date, self.yields = curve_date, dict(yields or {})
+
+    @classmethod
+    def from_treasury(cls, row: dict):
+        """RateCurve from one /fed/v1/treasury-yields row, or None when it has no usable yield."""
+        pts, ylds = [], {}
+        for field, years in C.TREASURY_TENORS:
+            try:
+                y = float(row.get(field))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(y) or not -5.0 < y < 30.0:           # percent; anything else is not a yield
+                continue
+            ylds[field] = y / 100.0
+            pts.append((years, 2.0 * math.log1p(y / 200.0)))
+        if not pts:
+            return None
+        try:
+            d = date.fromisoformat(str(row.get("date"))[:10])
+        except ValueError:
+            d = None
+        return cls(pts, d, ylds)
+
+    def rate(self, t: float) -> float:
+        return float(np.interp(t, self.t, self.r))
+
+
+def discount_rate(rates, t: float) -> float:
+    """The continuously compounded rate for maturity t (years): from the curve, else the fixed DISCOUNT_RATE."""
+    return rates.rate(t) if rates is not None else C.DISCOUNT_RATE
 
 
 # ---------------------------------------------------------------------------- one expiry
@@ -99,11 +145,11 @@ def wing(e: pd.DataFrame, kind: str) -> float | None:
     return float(np.interp(target, g.index.to_numpy(dtype=float), g.to_numpy(dtype=float)))
 
 
-def _expiry_row(e: pd.DataFrame, spot: float) -> dict:
+def _expiry_row(e: pd.DataFrame, spot: float, rates=None) -> dict:
     pr = pairs(e)
     T, root = float(e["T"].iloc[0]), str(e["root"].iloc[0])
     european = root in C.EUROPEAN_ROOTS
-    disc = math.exp(-C.DISCOUNT_RATE * T) if european else 1.0
+    disc = math.exp(-discount_rate(rates, T) * T) if european else 1.0
     f = forward(pr, spot)
     row = {"expiration": e["expiration"].iloc[0], "root": root,
            "settlement": "AM" if root in C.AM_SETTLED_ROOTS else "PM", "european": european,
@@ -138,13 +184,14 @@ def _expiry_row(e: pd.DataFrame, spot: float) -> dict:
     return row
 
 
-def build(session: dict, x: pd.DataFrame) -> pd.DataFrame:
-    """The surface: one row per expiry of the surface contracts, sorted by expiration."""
+def build(session: dict, x: pd.DataFrame, rates=None) -> pd.DataFrame:
+    """The surface: one row per expiry of the surface contracts, sorted by expiration (`rates`: a RateCurve for
+    the European straddles, None for the fixed DISCOUNT_RATE)."""
     spot = session.get("spot")
     rows = []
     if spot and len(x):
         for _, e in x[x["surface"]].groupby("expiration", sort=True):
-            rows.append(_expiry_row(e, float(spot)))
+            rows.append(_expiry_row(e, float(spot), rates))
     sf = pd.DataFrame(rows, columns=list(SURFACE_COLUMNS))
     for c in ("forward", "atm_strike", "straddle", "straddle_pct", "atm_iv", "atm_iv_cboe", "move_1sd_pct",
               "put25_iv", "call25_iv", "rr25", "bf25", "T"):

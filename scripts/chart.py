@@ -4,9 +4,11 @@ Chart data (plan 8.2) and the self-contained chart.html (plan 8.3).
 build_chart_data(ctx, metrics) turns one ticker analysis (the ctx of analyze.run_analysis and its metrics) into one
 JSON-safe dict for ui/chart.js: KPIs, the expected-move cone, the term structure, the smile, open interest and
 volume by strike, dealer gamma, the strategy screens, the earnings comparison, the option chain around the key
-expiries, unusual activity and the data notes. build_market_chart_data(members, metrics, rows) does the same for the
-market view. Every number is computed here or in the modules; ui/chart.js only draws. Big chains (SPX) are cut to
-strike windows first so one payload stays under CHART_MAX_BYTES.
+expiries, unusual activity, short interest and news (Massive, optional) and the data notes (with the discount rate
+and the holiday-calendar check). build_market_chart_data(members, metrics, rows) does the same for the market view.
+Every number is computed here or in the modules; ui/chart.js only draws. Big chains (SPX) are cut to strike windows
+first so one payload stays under CHART_MAX_BYTES. Third-party text (news, holiday names) stays text: ui/chart.js
+escapes it, and a news link is kept only when it is http(s).
 
 write_chart_html(chart_data, path) writes one HTML file with ui/chart.css, ui/i18n.js and ui/chart.js inlined and
 the data embedded as a JSON block: no server, no CDN, opens offline.
@@ -23,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 import config as C
+import modules as M
 import surface as SF
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui"
@@ -32,6 +35,13 @@ MARKET_KPIS = ("vix", "vix_vix3m", "spx_iv30", "ratio_30_90", "rr25", "gex", "em
 OI_WINDOWS = ("next", "d30", "d45", "all")
 SPARK_COLUMNS = (("cm_iv_30d", "spx_iv30"), ("ratio_30_90", "ratio_30_90"), ("rr25_30d", "rr25"),
                  ("net_gex_1pct", "gex"))
+NEWS_KEYS = ("available", "reason", "source", "window_from", "window_days", "n_articles", "truncated", "newest",
+             "oldest", "sentiment_counts")
+NEWS_ROW_KEYS = ("published_utc", "publisher", "title", "url", "sentiment", "sentiment_reasoning", "n_tickers")
+RATES_KEYS = ("available", "reason", "source", "european", "curve_date", "yields", "rate_30d", "rate_1y",
+              "fixed_rate")
+CALENDAR_KEYS = ("available", "reason", "source", "checked_from", "checked_through", "n_dates")
+MISMATCH_KEYS = ("date", "exchange", "exchange_close", "config", "config_close")
 
 
 # ---------------------------------------------------------------------------- value helpers
@@ -332,8 +342,34 @@ def _earnings(ea: dict, kind: str) -> dict:
             "comparison": cmp_, "notes": ea.get("notes") or [], "note_ids": ea.get("note_ids") or []}
 
 
-def _connection(metrics: dict) -> dict | None:
-    return _get(metrics, "meta", "connection", "fmp")
+def _news(nw: dict) -> dict:
+    """The headlines of modules.build_news (third-party text, already cleaned and cut); a link is kept only when
+    modules.safe_url accepts it (ui/chart.js checks the scheme again)."""
+    out = {k: nw.get(k) for k in NEWS_KEYS}
+    out["rows"] = [{**{k: r.get(k) for k in NEWS_ROW_KEYS}, "url": M.safe_url(r.get("url"))}
+                   for r in (nw.get("rows") or [])[:C.NEWS_ROWS] if isinstance(r, dict)]
+    out["notes"], out["note_ids"] = nw.get("notes") or [], nw.get("note_ids") or []
+    return out
+
+
+def _rates(r) -> dict | None:
+    """snapshot.rates: the discount rate of European-style options (Treasury curve or the fixed rate)."""
+    if not isinstance(r, dict):
+        return None
+    return {**{k: r.get(k) for k in RATES_KEYS}, "notes": r.get("notes") or [], "note_ids": r.get("note_ids") or []}
+
+
+def _calendar(cc) -> dict | None:
+    """data_quality.calendar_check; the holiday names come from Massive, so they are cleaned like news text."""
+    if not isinstance(cc, dict):
+        return None
+    return {**{k: cc.get(k) for k in CALENDAR_KEYS},
+            "mismatches": [{**{k: m.get(k) for k in MISMATCH_KEYS}, "name": M.clean_text(m.get("name"))}
+                           for m in cc.get("mismatches") or [] if isinstance(m, dict)]}
+
+
+def _connection(metrics: dict, source: str = "fmp") -> dict | None:
+    return _get(metrics, "meta", "connection", source)
 
 
 def _data_notes(metrics: dict, section_keys) -> dict:
@@ -365,7 +401,8 @@ def _data_notes(metrics: dict, section_keys) -> dict:
     return {"skipped": skipped, "notes": notes, "note_ids": note_ids, "warnings": dq.get("warnings") or [],
             "warning_ids": dq.get("warning_ids") or [], "restricted": meta.get("restricted") or [],
             "errors": meta.get("errors") or [], "stale": dq.get("stale"), "oi_note": dq.get("oi_note"),
-            "delay_note": dq.get("delay_note")}
+            "delay_note": dq.get("delay_note"), "rates": _rates(_get(metrics, "snapshot", "rates")),
+            "calendar_check": _calendar(dq.get("calendar_check"))}
 
 
 def _ticker_kpis(metrics: dict) -> list:
@@ -409,10 +446,11 @@ def _ticker_kpis(metrics: dict) -> list:
 
 def _meta(metrics: dict, mode: str, **extra) -> dict:
     dq = metrics.get("data_quality") or {}
+    fmp, massive = _connection(metrics), _connection(metrics, "massive")
     return {"mode": mode, "as_of": metrics["as_of"], "quote_time": metrics["quote_time"],
-            "data_source": metrics["data_source"], "disclaimer": C.DISCLAIMER, "connection": _connection(metrics),
-            "fmp_configured": _connection(metrics) is not None, "stale": dq.get("stale"),
-            "delay_note": dq.get("delay_note"), **extra}
+            "data_source": metrics["data_source"], "disclaimer": C.DISCLAIMER, "connection": fmp,
+            "fmp_configured": fmp is not None, "massive_connection": massive, "massive_configured": massive is not None,
+            "stale": dq.get("stale"), "delay_note": dq.get("delay_note"), **extra}
 
 
 # ---------------------------------------------------------------------------- public
@@ -440,6 +478,7 @@ def build_chart_data(ctx: dict, metrics: dict) -> dict:
         "flow": {"available": _avail(metrics["flow"]), "reason": metrics["flow"].get("reason"),
                  "rules": metrics["flow"].get("rules"), "direction_note": metrics["flow"].get("direction_note"),
                  "rows": (metrics["flow"].get("rows") or [])[:C.CHART_FLOW_ROWS]},
+        "news": _news(metrics.get("news") or {}),
         "skew": {k: metrics["skew"].get(k) for k in ("available", "reason", "rr25_30d", "bf25_30d", "label",
                                                      "rr25_pctl", "thresholds", "by_expiry")},
         "volatility": {k: metrics["volatility"].get(k) for k in ("available", "reason", "iv30_cboe", "cm_iv_30d",
@@ -447,12 +486,13 @@ def build_chart_data(ctx: dict, metrics: dict) -> dict:
                                                                  "iv_index", "realized", "vrp", "iv_hv_ratio",
                                                                  "iv_rank", "iv_rank_ex_event")},
         "positioning": {k: metrics["positioning"].get(k) for k in ("available", "reason", "pcr", "key_levels",
-                                                                   "far_otm", "max_pain", "oi_change")},
+                                                                   "far_otm", "max_pain", "oi_change", "short")},
         "market_context": metrics["market_context"],
         "history": {k: metrics["history"].get(k) for k in ("available", "reason", "days", "first_date",
                                                            "last_date", "saved_this_run", "data_dir")},
         "data_notes": _data_notes(metrics, ("market_context", "expected_move", "term_structure", "skew", "volatility",
-                                            "earnings", "positioning", "gamma", "flow", "strategies", "history")),
+                                            "earnings", "positioning", "gamma", "flow", "news", "strategies",
+                                            "history")),
     }
     return json_safe(data)
 
