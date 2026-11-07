@@ -6,12 +6,15 @@ The analysis modules of the ticker mode (plan 5.2-5.9). Each build_<module>(ctx)
 ctx keys used here: key, kind, as_of, session (spot, closed, ...), x (live standard-root contracts),
 sf (surface.build), earnings_date, earnings_known, ev (surface.event_expiries), earnings_rows,
 earnings_reason, bars (pd.Series of daily closes or None), bars_source, bars_reason, bars_proxy,
-iv_index (CBOE index rows or None), iv_index_symbol, iv_index_reason, history (history.HistoryView or None).
+iv_index (CBOE index rows or None), iv_index_symbol, iv_index_reason, history (history.HistoryView or None),
+and the Massive rows (None with a *_reason when unavailable): short_interest_rows, short_volume_rows, float_rows,
+news_rows, news_from.
 """
 from __future__ import annotations
 
 import math
-from datetime import date, timedelta
+import urllib.parse
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -433,6 +436,175 @@ def build_positioning(ctx: dict) -> dict:
     add_note(out, "max pain is weak evidence")
     h = ctx.get("history")
     out["oi_change"] = h.oi_change(ctx) if h is not None else unavailable("no history store")
+    return out
+
+
+# ---------------------------------------------------------------------------- short data (Massive, optional)
+def _day(v) -> date | None:
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except ValueError:
+        return None
+
+
+def _latest_first(items: list[dict], field: str) -> list[dict]:
+    """Newest first, one item per date."""
+    out, seen = [], set()
+    for it in sorted(items, key=lambda i: i[field], reverse=True):
+        if it[field] not in seen:
+            seen.add(it[field])
+            out.append(it)
+    return out
+
+
+def _float_block(rows, reason) -> dict:
+    if rows is None:
+        return unavailable(reason or "no free float data")
+    items = [r for r in rows if isinstance(r, dict) and _f(r.get("free_float"))]
+    if not items:
+        return unavailable("Massive has no free float for this symbol")
+    r = max(items, key=lambda i: str(i.get("effective_date") or ""))
+    pct = _f(r.get("free_float_percent"))
+    return block(free_float=int(_f(r["free_float"])), free_float_pct=pct / 100.0 if pct is not None else None,
+                 effective_date=_day(r.get("effective_date")))
+
+
+def _short_interest_block(rows, reason, as_of: date, fl: dict) -> dict:
+    if rows is None:
+        return unavailable(reason or "no short interest data")
+    items = []
+    for r in rows:
+        d, si = _day((r or {}).get("settlement_date")), _f((r or {}).get("short_interest"))
+        if d is None or si is None or si < 0 or d > as_of:
+            continue
+        adv = _f(r.get("avg_daily_volume"))
+        dtc = _f(r.get("days_to_cover"))
+        if dtc is None and adv:
+            dtc = si / adv
+        items.append({"settlement_date": d, "short_interest": int(round(si)),
+                      "avg_daily_volume": int(round(adv)) if adv is not None else None, "days_to_cover": dtc})
+    items = _latest_first(items, "settlement_date")[:C.SHORT_INTEREST_ROWS]
+    if not items:
+        return unavailable("Massive has no short interest for this symbol")
+    last, prev = items[0], (items[1] if len(items) > 1 else None)
+    ff = fl.get("free_float") if fl.get("available") else None
+    out = block(settlement_date=last["settlement_date"], short_interest=last["short_interest"],
+                avg_daily_volume=last["avg_daily_volume"], days_to_cover=last["days_to_cover"],
+                pct_float=last["short_interest"] / ff if ff else None,
+                change_pct=(last["short_interest"] / prev["short_interest"] - 1.0)
+                if prev and prev["short_interest"] else None,
+                prev_settlement_date=prev["settlement_date"] if prev else None,
+                age_days=(as_of - last["settlement_date"]).days, rows=items)
+    add_note(out, nid="short_interest_lag")
+    return out
+
+
+def _short_volume_block(rows, reason, as_of: date) -> dict:
+    if rows is None:
+        return unavailable(reason or "no short sale volume data")
+    items = []
+    for r in rows:
+        d, sv, tv = _day((r or {}).get("date")), _f((r or {}).get("short_volume")), _f((r or {}).get("total_volume"))
+        if d is None or sv is None or not tv or tv <= 0 or sv < 0 or d > as_of:
+            continue
+        items.append({"date": d, "short_volume": int(round(sv)), "total_volume": int(round(tv)), "ratio": sv / tv})
+    items = _latest_first(items, "date")[:C.SHORT_VOLUME_DAYS]
+    if not items:
+        return unavailable("Massive has no short sale volume for this symbol")
+    last = items[0]
+    out = block(date=last["date"], short_volume=last["short_volume"], total_volume=last["total_volume"],
+                ratio=last["ratio"], avg_ratio=float(np.mean([i["ratio"] for i in items])), days=len(items),
+                rows=items)
+    add_note(out, nid="short_volume_mm")
+    return out
+
+
+def build_short(ctx: dict) -> dict:
+    """positioning.short: short interest (FINRA, twice a month), daily short sale volume and the free float, from
+    Massive (stocks and ETFs; optional)."""
+    if ctx["kind"] == "index":
+        return unavailable("short data applies to stocks and ETFs", source="Massive")
+    fl = _float_block(ctx.get("float_rows"), ctx.get("float_reason"))
+    si = _short_interest_block(ctx.get("short_interest_rows"), ctx.get("short_interest_reason"), ctx["as_of"], fl)
+    sv = _short_volume_block(ctx.get("short_volume_rows"), ctx.get("short_volume_reason"), ctx["as_of"])
+    if not (si["available"] or sv["available"]):
+        return unavailable(si.get("reason") or sv.get("reason"), source="Massive", interest=si, volume=sv,
+                           float=fl)
+    return block(source="Massive", interest=si, volume=sv, float=fl)
+
+
+# ---------------------------------------------------------------------------- news (Massive, optional)
+def clean_text(v, limit: int = C.NEWS_TEXT_CHARS) -> str | None:
+    """Third-party text for metrics.json: printable characters only, whitespace collapsed, at most `limit`
+    characters (cut with an ellipsis)."""
+    if not isinstance(v, str):
+        return None
+    t = " ".join("".join(ch if ch.isprintable() else " " for ch in v).split())
+    if not t:
+        return None
+    return t if len(t) <= limit else t[:limit - 1].rstrip() + "\u2026"
+
+
+def safe_url(v) -> str | None:
+    """An http(s) link with a host and no characters that could break out of a page attribute, else None."""
+    if not isinstance(v, str):
+        return None
+    u = v.strip()
+    if len(u) > 500 or any(c in u for c in ' "\'<>\\`') or not u.isprintable():
+        return None
+    parts = urllib.parse.urlsplit(u)
+    return u if parts.scheme in ("http", "https") and parts.netloc else None
+
+
+def _published(v) -> str | None:
+    try:
+        t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_news(ctx: dict) -> dict:
+    """news: the latest headlines about the ticker with the provider's sentiment label for it (Massive; stocks and
+    ETFs; optional). Text is third-party data, cleaned and cut to NEWS_TEXT_CHARS."""
+    key = ctx["key"].upper()
+    if ctx["kind"] == "index":
+        return unavailable("news applies to stocks and ETFs", source="Massive")
+    rows = ctx.get("news_rows")
+    if rows is None:
+        return unavailable(ctx.get("news_reason") or "no news data", source="Massive")
+    counts = {s: 0 for s in C.ENUMS["sent_"]}
+    counts["unlabeled"] = 0
+    items, seen = [], set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        title, pub = clean_text(r.get("title")), _published(r.get("published_utc"))
+        ident = r.get("id") or (title, pub)
+        if not title or pub is None or ident in seen:
+            continue
+        seen.add(ident)
+        ins = next((i for i in r.get("insights") or [] if isinstance(i, dict)
+                    and str(i.get("ticker", "")).upper() == key), None)
+        sent = str((ins or {}).get("sentiment") or "").lower()
+        sent = sent if sent in C.ENUMS["sent_"] else None
+        counts[sent or "unlabeled"] += 1
+        items.append({"published_utc": pub, "publisher": clean_text((r.get("publisher") or {}).get("name"), 80)
+                      if isinstance(r.get("publisher"), dict) else None,
+                      "title": title, "url": safe_url(r.get("article_url")), "sentiment": sent,
+                      "sentiment_reasoning": clean_text((ins or {}).get("sentiment_reasoning")),
+                      "n_tickers": len(r.get("tickers") or []) if isinstance(r.get("tickers"), list) else None})
+    items.sort(key=lambda i: i["published_utc"], reverse=True)
+    out = block(source="Massive", window_from=ctx.get("news_from"), window_days=C.NEWS_LOOKBACK_DAYS,
+                n_articles=len(items), truncated=len(rows) >= C.NEWS_FETCH,
+                newest=items[0]["published_utc"] if items else None,
+                oldest=items[-1]["published_utc"] if items else None, sentiment_counts=counts,
+                rows=items[:C.NEWS_ROWS])
+    if not items:
+        add_note(out, f"no articles about {ctx['key']} since {ctx.get('news_from') or 'the window start'}")
+    add_note(out, nid="news_third_party")
     return out
 
 

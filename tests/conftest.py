@@ -35,6 +35,16 @@ def real_data() -> Path:
     return p
 
 
+@pytest.fixture(autouse=True)
+def no_massive_key(monkeypatch):
+    """No test reaches Massive through the environment: MASSIVE_API_KEY is removed (the cloud environment and a
+    machine that ran `setx MASSIVE_API_KEY` have one) and the Windows registry is not read; a test that wants
+    Massive passes a fake client."""
+    import winenv
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setattr(winenv, "load_user_env", lambda names=None: [])
+
+
 @pytest.fixture
 def no_network(monkeypatch):
     def refuse(*a, **k):

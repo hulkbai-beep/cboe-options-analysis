@@ -1,12 +1,16 @@
 """
 data_quality blocks (plan 4.4, 5.1, 5.3, 5.8): counts, self-checks and the warnings with their i18n ids.
-Shared by the ticker mode and every member of the market mode.
+Shared by the ticker mode and every member of the market mode. calendar_check() compares the exchange holiday
+calendar (Massive, optional) with config.MARKET_HOLIDAYS / EARLY_CLOSES in both modes.
 """
 from __future__ import annotations
 
 import config as C
 import chain as CH
-from modules import add_warning
+import massive_client as MC
+from modules import add_warning, block, unavailable
+
+CALENDAR_DATES_SHOWN = 5          # dates named in the calendar_mismatch warning
 
 
 def iv_price_check(sf) -> dict:
@@ -53,3 +57,24 @@ def data_quality(ctx: dict, now=None) -> dict:
     if cm30 is not None and iv30 is not None and abs(iv30 - cm30) > C.IV30_CHECK_TOL:
         add_warning(dq, "iv30_check", (f"{iv30:.1%}", f"{cm30:.1%}"))
     return dq
+
+
+def calendar_check(dq: dict, rows, reason: str | None, today) -> dict:
+    """dq["calendar_check"]: the NYSE holiday calendar from Massive (rows of /v1/marketstatus/upcoming, or None with
+    a reason) against MARKET_HOLIDAYS and EARLY_CLOSES from `today` (New York date) on; a mismatch adds the
+    calendar_mismatch warning, because the session, staleness and business-day logic read config.py."""
+    if rows is None:
+        dq["calendar_check"] = unavailable(reason or "no exchange calendar", source="Massive")
+        return dq["calendar_check"]
+    cmp = MC.compare_calendar(rows, today)
+    if not cmp["checked_through"]:
+        dq["calendar_check"] = unavailable("Massive listed no upcoming exchange holidays", source="Massive")
+        return dq["calendar_check"]
+    out = block(source="Massive", checked_from=cmp["checked_from"], checked_through=cmp["checked_through"],
+                n_dates=cmp["n_dates"], mismatches=cmp["mismatches"])
+    dq["calendar_check"] = out
+    mm = cmp["mismatches"]
+    if mm:
+        shown = ", ".join(m["date"].isoformat() for m in mm[:CALENDAR_DATES_SHOWN])
+        add_warning(dq, "calendar_mismatch", (len(mm), shown + (", ..." if len(mm) > CALENDAR_DATES_SHOWN else "")))
+    return out

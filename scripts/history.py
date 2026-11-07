@@ -238,12 +238,13 @@ def summary_from_ctx(ctx: dict) -> dict:
     return {k: row[k] for k in C.SUMMARY_COLUMNS}
 
 
-def summary_row(session: dict, frame: pd.DataFrame, kind: str, earnings_date=None, key: str | None = None) -> dict:
+def summary_row(session: dict, frame: pd.DataFrame, kind: str, earnings_date=None, key: str | None = None,
+                rates=None) -> dict:
     """One summary row from a session and its contracts (the same call in snapshot.py, run_analysis and
-    --rebuild-summary)."""
+    --rebuild-summary; `rates` discounts European straddles as in surface.build)."""
     import core
     key = key or str(session.get("key") or session.get("symbol") or "").lstrip("^_")
-    ctx = core.chain_context(key, kind, session, frame, earnings_date)
+    ctx = core.chain_context(key, kind, session, frame, earnings_date, rates=rates)
     core.run_chain_modules(ctx)
     return summary_from_ctx(ctx)
 

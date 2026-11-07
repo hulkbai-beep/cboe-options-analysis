@@ -1,14 +1,18 @@
 """
 Data loading for one analysis (plan 3.4 step 2).
 
-load_all(text, cboe, fmp, now=None, market_context=True) -> dict with the symbol info (symbols.normalize, with the
-"_" fallback for an index that is not in config.INDEX_SYMBOLS), the CBOE payload and its session, and the optional
-pieces: FMP profile, earnings, dividends and daily closes, the CBOE volatility-index history, and the _SPX / _VIX
-chains and VIX history for the market context.
+load_all(text, cboe, fmp, now=None, market_context=True, ms=None) -> dict with the symbol info (symbols.normalize,
+with the "_" fallback for an index that is not in config.INDEX_SYMBOLS), the CBOE payload and its session, and the
+optional pieces: FMP profile, earnings, dividends and daily closes, the CBOE volatility-index history, the _SPX /
+_VIX chains and VIX history for the market context, and from Massive the Treasury curve that discounts European
+index options, short interest, short sale volume, free float, news, dividends when FMP has none, and the exchange
+holiday calendar.
 
-FMP is optional: every FMP request goes through FmpState.get(), which turns a missing key, a rejected key, an
-unreachable host or a plan restriction into a reason string (and meta.restricted / meta.notes), never into an
-exception. CBOE errors on the main chain propagate (NotFound, CboeUnreachable, CboeError).
+FMP and Massive are optional: every request goes through FmpState.get() or MassiveState.results(), which turn a
+missing key, a rejected key, an unreachable host, a plan restriction or (Massive) the rate limit into a reason
+string (and meta.restricted / meta.notes), never into an exception. CBOE errors on the main chain propagate
+(NotFound, CboeUnreachable, CboeError). Massive requests go in order of importance (the discount curve first, the
+holiday calendar last and only when a request slot is free at once), because the free plan allows 5 a minute.
 """
 from __future__ import annotations
 
@@ -21,11 +25,15 @@ import pandas as pd
 import config as C
 import chain as CH
 import fmp_client
+import massive_client as MC
+import surface as SF
 from cboe_client import CboeError, NotFound
 from symbols import kind_from_profile, normalize
 
 FULL = "historical-price-eod/full"
 FMP_NOT_CONFIGURED = "FMP not configured"
+MASSIVE_NOT_CONFIGURED = "Massive not configured"
+STOCK_DATA_ONLY = "applies to stocks and ETFs"
 
 
 def make_fmp(refresh: bool = False):
@@ -92,6 +100,152 @@ class FmpState:
             return 0, 0
         st = getattr(self.client, "stats", {}) or {}
         return int(st.get("network_calls", 0)), int(st.get("cache_hits", 0))
+
+
+def make_massive(refresh: bool = False):
+    """(MassiveClient or None, reason): a client only when MASSIVE_API_KEY is set and the client starts."""
+    if not os.environ.get("MASSIVE_API_KEY", "").strip():
+        return None, MASSIVE_NOT_CONFIGURED
+    try:
+        return MC.MassiveClient(refresh=refresh), None
+    except MC.InvalidKey:
+        return None, "Massive key rejected"
+    except MC.MassiveError as e:
+        return None, f"Massive error: {e}"
+
+
+class MassiveState:
+    """Optional Massive requests with reasons instead of exceptions (the same contract as FmpState)."""
+
+    def __init__(self, client=None, reason: str | None = None):
+        self.client = client
+        self.dead = None if client is not None else (reason or MASSIVE_NOT_CONFIGURED)
+        self.restricted: list[str] = []
+        self.notes: list[str] = []
+        self._hinted = False
+
+    @property
+    def configured(self) -> bool:
+        return self.client is not None
+
+    def _hint(self):
+        if not self._hinted:
+            self._hinted = True
+            print("[massive] some Massive data is unavailable; run `python scripts/massive_client.py check` to test "
+                  "the connection and your plan", file=sys.stderr)
+
+    def results(self, path: str, wait=None, **params):
+        """(rows, None) or (None, reason)."""
+        if self.dead:
+            return None, self.dead
+        try:
+            return self.client.results(path, wait=wait, **params), None
+        except MC.InvalidKey:
+            self.dead = "Massive key rejected"
+            self.notes.append("Massive key rejected: Massive data is unavailable")
+        except MC.Unreachable as e:
+            self.dead = f"Massive unreachable: {e}"
+            self.notes.append(self.dead)
+        except MC.RestrictedEndpoint:
+            label = f"Massive {path} ({params.get('ticker')})" if params.get("ticker") else f"Massive {path}"
+            if label not in self.restricted:
+                self.restricted.append(label)
+            self._hint()
+            return None, f"restricted on the current Massive plan: {path}"
+        except MC.RateLimited as e:
+            return None, f"skipped for Massive's rate limit: {e}"
+        except MC.MassiveError as e:
+            msg = f"Massive error on {path}: {e}"
+            self.notes.append(msg)
+            self._hint()
+            return None, msg
+        self._hint()
+        return None, self.dead
+
+    def describe(self):
+        return self.client.describe() if self.client is not None else None
+
+    def calls(self) -> tuple[int, int]:
+        if self.client is None:
+            return 0, 0
+        st = getattr(self.client, "stats", {}) or {}
+        return int(st.get("network_calls", 0)), int(st.get("cache_hits", 0))
+
+
+# ---------------------------------------------------------------------------- Treasury discount curve (Massive)
+def curve_from_rows(rows, as_of: date):
+    """(RateCurve, None) from the latest Treasury row dated on or before as_of and at most RATES_MAX_AGE_DAYS
+    earlier, else (None, reason)."""
+    best = None
+    for r in rows or []:
+        try:
+            d = date.fromisoformat(str(r.get("date"))[:10])
+        except (AttributeError, ValueError):
+            continue
+        if d <= as_of and (best is None or d > best[0]):
+            best = (d, r)
+    if best is None:
+        return None, f"no Treasury curve on or before {as_of}"
+    if (as_of - best[0]).days > C.RATES_MAX_AGE_DAYS:
+        return None, (f"the latest Treasury curve is from {best[0]}, more than {C.RATES_MAX_AGE_DAYS} days before "
+                      f"{as_of}")
+    curve = SF.RateCurve.from_treasury(best[1])
+    return (curve, None) if curve is not None else (None, f"the Treasury curve of {best[0]} has no yields")
+
+
+def load_rates(ms: MassiveState, as_of: date):
+    """(RateCurve or None, reason): the Treasury curve for as_of."""
+    rows, why = ms.results(MC.TREASURY, **{"date.lte": as_of.isoformat()}, sort="date.desc", limit=1)
+    if rows is None:
+        return None, why
+    return curve_from_rows(rows, as_of)
+
+
+def load_rate_history(ms: MassiveState, start: date, end: date):
+    """(rows, None) or (None, reason): the Treasury rows from RATES_MAX_AGE_DAYS before `start` through `end`, one
+    request per calendar year (for --rebuild-summary)."""
+    lo, rows = start - timedelta(days=C.RATES_MAX_AGE_DAYS), []
+    for year in range(lo.year, end.year + 1):
+        a, b = max(lo, date(year, 1, 1)), min(end, date(year, 12, 31))
+        got, why = ms.results(MC.TREASURY, **{"date.gte": a.isoformat(), "date.lte": b.isoformat()}, sort="date.asc",
+                              limit=400)
+        if got is None:
+            return None, why
+        rows += got
+    return rows, None
+
+
+def rates_block(curve, reason: str | None, european: bool) -> dict:
+    """snapshot.rates: where the discount rates of European straddles came from (also read when the ticker has
+    none: the SPX of the market context is European)."""
+    from modules import add_note, block
+    if curve is not None:
+        out = block(source="treasury", european=european, curve_date=curve.curve_date,
+                    yields={k.replace("yield_", ""): v for k, v in curve.yields.items()},
+                    rate_30d=curve.rate(30 / 365), rate_1y=curve.rate(1.0), fixed_rate=C.DISCOUNT_RATE)
+    else:
+        out = block(source="fixed", european=european, curve_date=None, yields=None, rate_30d=C.DISCOUNT_RATE,
+                    rate_1y=C.DISCOUNT_RATE, fixed_rate=C.DISCOUNT_RATE, reason=reason)
+        if european:
+            add_note(out, nid="rates_fixed", args=(f"{C.DISCOUNT_RATE:.0%}", reason or MASSIVE_NOT_CONFIGURED))
+    return out
+
+
+def massive_dividends(ms: MassiveState, key: str, as_of: date):
+    """(rows [(ex_date, amount)] after as_of, None) or (None, reason): cash dividends from Massive."""
+    rows, why = ms.results(MC.DIVIDENDS, ticker=key, **{"ex_dividend_date.gt": as_of.isoformat()},
+                           sort="ex_dividend_date.asc", limit=10)
+    if rows is None:
+        return None, why
+    ahead = []
+    for r in rows:
+        try:
+            d, a = date.fromisoformat(str(r["ex_dividend_date"])[:10]), float(r["cash_amount"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if d > as_of and a > 0 and str(r.get("currency") or "USD").upper() == "USD":
+            ahead.append((d, a))
+    return sorted(ahead), None
 
 
 def closes_from_rows(rows, as_of: date, scale: float = 1.0) -> pd.Series:
@@ -161,8 +315,9 @@ def index_or_reason(cboe, index: str, memo: dict):
     return memo[index]
 
 
-def load_all(text: str, cboe, fs: FmpState, now=None, market_context: bool = True) -> dict:
+def load_all(text: str, cboe, fs: FmpState, now=None, market_context: bool = True, ms: MassiveState | None = None) -> dict:
     """Everything one ticker analysis needs (see the module docstring)."""
+    ms = ms if ms is not None else MassiveState(None)
     sym = normalize(text)                                  # raises SymbolRejected / ValueError
     key = sym["key"]
     notes, note_ids = [], []
@@ -192,7 +347,7 @@ def load_all(text: str, cboe, fs: FmpState, now=None, market_context: bool = Tru
         out["earnings_rows"], out["earnings_reason"] = (rows or None), why
         if rows is not None and not rows:
             out["earnings_reason"] = "FMP returned no earnings dates"
-    out["dividends"], out["dividends_reason"] = [], None
+    out["dividends"], out["dividends_reason"], out["dividends_source"] = [], None, None
     if kind in ("stock", "etf"):
         rows, why = fs.get("dividends", symbol=sym["fmp"])
         out["dividends_reason"] = why
@@ -205,6 +360,7 @@ def load_all(text: str, cboe, fs: FmpState, now=None, market_context: bool = Tru
             if d > as_of:
                 ahead.append((d, a))
         out["dividends"] = sorted(ahead)
+        out["dividends_source"] = "fmp" if rows is not None else None
     out["bars"], out["bars_source"], out["bars_proxy"], out["bars_reason"] = None, None, None, None
     if sym["fmp"]:
         bars, why = load_bars(fs, sym["fmp"], as_of, sym["fmp_scale"] or 1.0)
@@ -240,4 +396,40 @@ def load_all(text: str, cboe, fs: FmpState, now=None, market_context: bool = Tru
         mk["vix_rows"], mk["vix_rows_reason"] = index_or_reason(cboe, "VIX", memo)
         out["market"] = mk
     out["fmp_profile_reason"] = profile_reason
+    load_massive(out, ms, market_context)
     return out
+
+
+def load_massive(out: dict, ms: MassiveState, market_context: bool) -> None:
+    """The Massive pieces of one ticker analysis into `out` (each as rows or None with a reason), in order of
+    importance: the discount curve (indexes, and the SPX of the market context), short interest, short sale
+    volume, free float (stocks), news, dividends when FMP gave no answer, and the holiday calendar (only when a
+    request slot is free at once; it is cached for a day)."""
+    key, kind, as_of = out["key"], out["sym"]["kind"], out["session"]["as_of"]
+    out["rates"], out["rates_reason"] = None, "not needed: no European-style options in this run"
+    if kind == "index" or market_context:
+        out["rates"], out["rates_reason"] = load_rates(ms, as_of)
+    stock_data = kind in ("stock", "etf")
+    for name in ("short_interest", "short_volume", "float", "news"):
+        out[name], out[f"{name}_reason"] = None, (STOCK_DATA_ONLY if not stock_data else None)
+    out["news_from"] = None
+    if stock_data:
+        out["short_interest"], out["short_interest_reason"] = ms.results(
+            MC.SHORT_INTEREST, ticker=key, sort="settlement_date.desc", limit=C.SHORT_INTEREST_ROWS)
+        out["short_volume"], out["short_volume_reason"] = ms.results(
+            MC.SHORT_VOLUME, ticker=key, sort="date.desc", limit=C.SHORT_VOLUME_DAYS)
+        if kind == "stock":
+            out["float"], out["float_reason"] = ms.results(MC.FLOAT, ticker=key)
+        else:
+            out["float_reason"] = "ETFs have no free float"
+        frm = f"{(as_of - timedelta(days=C.NEWS_LOOKBACK_DAYS)).isoformat()}T00:00:00Z"
+        out["news_from"] = frm
+        out["news"], out["news_reason"] = ms.results(MC.NEWS, ticker=key, **{"published_utc.gte": frm}, order="desc",
+                                                     sort="published_utc", limit=C.NEWS_FETCH)
+        if out["dividends_source"] is None and out.get("dividends_reason") and ms.configured:
+            divs, why = massive_dividends(ms, key, as_of)
+            if divs is not None:
+                out["dividends"], out["dividends_source"] = divs, "massive"
+            else:
+                out["dividends_reason"] = f"{out['dividends_reason']}; Massive: {why}"
+    out["holidays"], out["holidays_reason"] = ms.results(MC.HOLIDAYS, wait=0)

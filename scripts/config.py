@@ -45,6 +45,24 @@ VIX = "^VIX"
 SPX_FMP = "^GSPC"                 # FMP daily bars for SPX (and XSP x 0.1)
 EOD_LOOKBACK_DAYS = 1130          # calendar days of FMP daily bars (~3 years 1 month: 12 earnings, 1-year HV percentile)
 
+# ---------------------------------------------------------------------------- Massive (optional, massive_client.py)
+MASSIVE_BASE = "https://api.massive.com"          # formerly Polygon.io (api.polygon.io is being retired)
+MASSIVE_CACHE_SUBDIR = "cboe-options-massive"     # ~/.cache/<this> unless MASSIVE_CACHE_DIR is set
+MASSIVE_MAX_PER_MIN = 5           # requests per minute (the free plan); the MASSIVE_MAX_PER_MIN variable overrides
+MASSIVE_MAX_WAIT = 65             # seconds a request may wait for a free slot (one 60 s window); longer -> skipped
+MASSIVE_TIMEOUT = 30              # seconds per response
+SHORT_INTEREST_ROWS = 6           # short-interest settlements read (twice a month: about three months)
+SHORT_VOLUME_DAYS = 10            # trading days of short sale volume
+NEWS_LOOKBACK_DAYS = 3            # calendar days of news before the data time
+NEWS_FETCH = 50                   # articles read per run
+NEWS_ROWS = 8                     # headlines kept in metrics.json (newest first)
+NEWS_TEXT_CHARS = 300             # titles and sentiment reasoning are cut to this many characters
+RATES_MAX_AGE_DAYS = 7            # a Treasury curve dated more than this many calendar days before as_of is not used
+TREASURY_TENORS = (               # Massive /fed/v1/treasury-yields field -> maturity in years (yields in percent)
+    ("yield_1_month", 1 / 12), ("yield_3_month", 0.25), ("yield_1_year", 1.0), ("yield_2_year", 2.0),
+    ("yield_5_year", 5.0), ("yield_10_year", 10.0), ("yield_30_year", 30.0),
+)
+
 # ---------------------------------------------------------------------------- calendar (maintain yearly; check NYSE)
 MARKET_HOLIDAYS = (
     date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3), date(2026, 5, 25),
@@ -97,7 +115,7 @@ IV30_CHECK_TOL = 0.01             # |iv30_cboe - cm_iv_30d| above this (1 vol po
 FWD_STRIKE_RANGE = 0.20           # strikes within +-20% of spot for the forward
 FWD_MEDIAN_N = 5                  # median of K + C - P over the 5 strikes with the smallest |C - P|
 ATM_MAX_BRACKET = 0.10            # largest gap (relative to F) between the strikes that bracket the forward
-DISCOUNT_RATE = 0.04              # discounting of European index straddles when backing out the ATM IV
+DISCOUNT_RATE = 0.04              # discounting of European index straddles without a Treasury curve (Massive)
 IV_SOLVER_BOUNDS = (1e-4, 10.0)   # bisection range for the straddle-implied volatility
 IV_SOLVER_TOL = 1e-10
 IV_SOLVER_MAX_ITER = 200
@@ -231,12 +249,17 @@ ENUMS = {
     "ivsrc_": ("straddle", "cboe_fallback"),
     "iv30src_": ("history", "cboe"),
     "evidence_": ("weak",),
+    "sent_": ("positive", "neutral", "negative"),              # news sentiment toward the ticker (Massive)
+    "ratesrc_": ("treasury", "fixed"),                          # snapshot.rates.source
+    "divsrc_": ("fmp", "massive"),                              # where the dividends came from
+    "cal_": ("closed", "early_close", "open"),                  # data_quality.calendar_check.mismatches
     # fixed sentences: notes[i] / warnings[i] / reason / error with an id (plan 8.1, 9.5)
     "note_": ("no_event_premium", "early_assignment", "ex_div_call", "closed_spread", "straddle_non_event",
               "earnings_today", "earnings_unknown", "intraday_rank", "ndx_proxy", "index_close_from",
-              "ratios_from", "ex_event_unavailable", "index_fallback", "oi_base_gap"),
+              "ratios_from", "ex_event_unavailable", "index_fallback", "oi_base_gap", "short_interest_lag",
+              "short_volume_mm", "news_third_party", "rates_fixed", "dividends_massive"),
     "warn_": ("overnight_quotes", "stale_quotes", "iv_price_check", "gamma_check", "iv30_check",
-              "intraday_quotes", "no_live_quotes"),
+              "intraday_quotes", "no_live_quotes", "calendar_mismatch"),
     "reason_": ("ivr_building",),
     "err_": ("vix_futures", "djx"),
 }
@@ -259,6 +282,13 @@ NOTES = {
     "ex_event_unavailable": "ex-event IV unavailable: earnings date unknown or event move not isolated",
     "index_fallback": INDEX_FALLBACK_NOTE,
     "oi_base_gap": "open-interest base snapshot is from {}, {} calendar days before as_of",
+    "short_interest_lag": "short interest is reported twice a month, about a week after the settlement date",
+    "short_volume_mm": ("short sale volume includes market makers' short sales, most of them hedges: read the trend, "
+                        "not one day"),
+    "news_third_party": ("headlines and sentiment labels come from the news provider; they neither explain nor "
+                         "forecast a price or IV move"),
+    "rates_fixed": "European index options discounted at the fixed {} rate: {}",
+    "dividends_massive": "dividends from Massive (FMP: {})",
 }
 WARNINGS = {
     "overnight_quotes": "option quotes are from the overnight (GTH) session; the underlying price is still the {} close",
@@ -268,5 +298,7 @@ WARNINGS = {
     "iv30_check": "CBOE iv30 {} differs from the 30-day constant-maturity IV {} by more than 1 vol point",
     "intraday_quotes": "intraday data: the session has not closed; values will change",
     "no_live_quotes": "no live two-sided quotes in the chain",
+    "calendar_mismatch": ("the trading calendar in scripts/config.py differs from the exchange calendar on {} date(s) "
+                          "({}): update MARKET_HOLIDAYS and EARLY_CLOSES"),
 }
 REASONS = {"ivr_building": "history {} days, need {}"}

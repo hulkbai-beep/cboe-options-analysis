@@ -179,7 +179,8 @@ def build_strategies(ctx: dict) -> dict:
         "iv_rank_ex_event": ((vol.get("iv_rank_ex_event") or {}).get("value")
                              if (vol.get("iv_rank_ex_event") or {}).get("available") else None),
         "term_shape": ts.get("shape"), "skew_label": sk.get("label"),
-        "next_earnings": earn if kind == "stock" else None},
+        "next_earnings": earn if kind == "stock" else None,
+        "dividends_source": ctx.get("dividends_source") if kind != "index" else None},
         filters={"min_oi": C.STRAT_MIN_OI, "max_spread": C.STRAT_MAX_SPREAD,
                  "strategies": {k: {"type": v[0], "delta": list(v[1]), "dte": list(v[2]), "target_delta": v[3]}
                                 for k, v in C.STRATEGIES.items()}})
@@ -187,6 +188,8 @@ def build_strategies(ctx: dict) -> dict:
         add_note(out, nid="earnings_unknown")
     if ctx["session"].get("closed"):
         add_note(out, nid="closed_spread")
+    if kind != "index" and ctx.get("dividends_source") == "massive":
+        add_note(out, nid="dividends_massive", args=(ctx.get("dividends_reason") or "no answer",))
     add_note(out, "risk-neutral arithmetic from option prices, not advice")
     ctx["strategy_candidates"] = {}
     for name in C.STRATEGIES:

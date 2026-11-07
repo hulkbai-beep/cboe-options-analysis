@@ -199,9 +199,9 @@ def test_history_saves_once(synth_data, tmp_path):
 # ---------------------------------------------------------------------------- command line
 @pytest.fixture
 def cli(synth_data, monkeypatch, tmp_path):
-    def clients(client, fmp, refresh):
+    def clients(client, fmp, refresh, massive=None):
         cboe, f = fakes_for(synth_data)
-        return cboe, fetch.FmpState(f)
+        return cboe, fetch.FmpState(f), fetch.MassiveState(None)
 
     monkeypatch.setattr(analyze, "_clients", clients)
     monkeypatch.chdir(tmp_path)
@@ -239,7 +239,8 @@ def test_cli_never_prints_the_key(cli, capsys, monkeypatch):
         def get_chain(self, symbol):
             raise CboeUnreachable(f"cannot reach the feed (url had apikey={secret})")
 
-    monkeypatch.setattr(analyze, "_clients", lambda c, f, r: (Down(), fetch.FmpState(None)))
+    monkeypatch.setattr(analyze, "_clients", lambda c, f, r, m=None: (Down(), fetch.FmpState(None),
+                                                                      fetch.MassiveState(None)))
     assert analyze.main(["SPY"]) == 1
     err = capsys.readouterr().err
     assert secret not in err and "apikey=***" in err

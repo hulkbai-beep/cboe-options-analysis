@@ -1,8 +1,8 @@
 """
 The market view (plan 7) and the market context of the ticker mode (plan 5.10).
 
-- member(key, kind, payload) -> ctx with the chain modules (term structure, expected move, skew, positioning,
-  gamma) of one MARKET_UNIVERSE member, the same computation as the ticker mode.
+- member(key, kind, payload, rates=None) -> ctx with the chain modules (term structure, expected move, skew,
+  positioning, gamma) of one MARKET_UNIVERSE member, the same computation as the ticker mode.
 - vix_block(vix_session, vix_rows, vix3m_rows, vix9d_rows, as_of): level, band, change, 1-year percentile and
   the VIX/VIX3M and VIX9D/VIX ratios with their percentiles (CBOE index CSVs aligned on common dates).
 - thermometer(vix, spx_mods, hv20): the six flags with value, threshold and fired, and the summary label.
@@ -26,10 +26,10 @@ def band(level) -> str | None:
     return next(lbl for hi, lbl in C.VIX_BANDS if level < hi)
 
 
-def member(key: str, kind: str, payload: dict) -> dict:
+def member(key: str, kind: str, payload: dict, rates=None) -> dict:
     """ctx of one market member with its chain modules (exceptions propagate)."""
     session, frame, _x, _info = CH.load_payload(payload, key)
-    ctx = core.chain_context(key, kind, session, frame)
+    ctx = core.chain_context(key, kind, session, frame, rates=rates)
     core.run_chain_modules(ctx)
     return ctx
 

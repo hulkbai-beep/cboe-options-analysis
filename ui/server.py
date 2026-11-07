@@ -50,8 +50,10 @@ STATIC_TYPES = {
 }
 NO_KEY_WARNING = ("FMP_API_KEY not set: earnings, realized volatility, dividends and the price cone will be "
                   "unavailable")
+NO_MASSIVE_WARNING = ("MASSIVE_API_KEY not set (optional): short interest, news, the Treasury discount curve and the "
+                      "holiday-calendar check will be unavailable")
 
-_lock = threading.Lock()  # the CBOE/FMP caches, rate limits and the history store: one analysis at a time
+_lock = threading.Lock()  # the CBOE/FMP/Massive caches, rate limits and the history store: one analysis at a time
 
 
 # ---------------------------------------------------------------------------- environment
@@ -67,10 +69,11 @@ def apply_proxy_tls_rule() -> bool:
 
 
 def redact(text: str) -> str:
-    """Remove the API key (and any apikey=... query value) from a message."""
-    key = os.environ.get("FMP_API_KEY", "").strip()
-    if key:
-        text = text.replace(key, "***")
+    """Remove the API keys (and any apikey=... query value) from a message."""
+    for name in ("FMP_API_KEY", "MASSIVE_API_KEY"):
+        key = os.environ.get(name, "").strip()
+        if key:
+            text = text.replace(key, "***")
     return re.sub(r"(?i)(apikey=)[^&\s\"']+", r"\1***", text)
 
 
@@ -228,6 +231,8 @@ def main(argv=None):
               "(this process only).", file=sys.stderr)
     if not os.environ.get("FMP_API_KEY"):
         print(f"Warning: {NO_KEY_WARNING}. See SKILL.md > Setup.", file=sys.stderr)
+    if not os.environ.get("MASSIVE_API_KEY"):
+        print(f"Note: {NO_MASSIVE_WARNING}. See SKILL.md > Setup.", file=sys.stderr)
 
     srv = make_server(args.port)
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
