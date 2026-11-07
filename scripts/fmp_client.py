@@ -26,7 +26,8 @@ Connection settings (environment variables):
                     (default "header" = FMP's apikey header; auto-detected for proxies)
   FMP_TLS_VERIFY    "0" turns off HTTPS certificate verification (needed for many
                     bare-IP proxies; less secure). Default "1". Ignored for the official
-                    FMP host, whose certificate is always verified.
+                    FMP host, whose certificate is always verified, as tls.py describes
+                    (the operating system's certificate store, certifi, SSL_CERT_FILE).
   FMP_MAX_PER_MIN   request rate cap shared by all threads (default 280).
   FMP_TIMEOUT       seconds to wait for each response (default 30).
   FMP_CACHE_DIR     cache folder (default ~/.cache/cboe-options-fmp).
@@ -55,6 +56,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import config as C
+import tls
 
 OFFICIAL_BASE = "https://financialmodelingprep.com"
 OFFICIAL_HOSTS = {"financialmodelingprep.com", "www.financialmodelingprep.com"}
@@ -190,7 +192,8 @@ class FMPClient:
             print(f"[fmp] FMP_TLS_VERIFY=0 ignored for {self.host}: certificate verification stays on "
                   f"for the official API.", file=sys.stderr)
             self.tls_verify = True
-        self._ssl_ctx = None if self.tls_verify else ssl._create_unverified_context()
+        self._trust = tls.trust() if self.tls_verify else None
+        self._ssl_ctx = self._trust.context if self._trust else ssl._create_unverified_context()
         if not self.tls_verify:
             print(f"[fmp] WARNING: HTTPS certificate verification is OFF for {self.host} "
                   f"(FMP_TLS_VERIFY=0).", file=sys.stderr)
@@ -277,7 +280,7 @@ class FMPClient:
                         break
                     except (urllib.error.URLError, OSError) as e:  # OSError covers read timeouts
                         if _is_cert_error(e):
-                            raise FMPError(self._cert_hint())
+                            raise FMPError(self._cert_hint(e))
                         if attempt == 0 and _is_timeout(e):
                             continue
                         raise Unreachable(self._unreachable_hint(e))
@@ -306,16 +309,19 @@ class FMPClient:
             msg += " Check FMP_BASE_URL and the network connection."
         return msg
 
-    def _cert_hint(self):
-        return (f"HTTPS certificate verification failed for {self.host}. This is common for "
-                f"proxies addressed by a bare IP. To run anyway, set FMP_TLS_VERIFY=0 "
-                f"(traffic can then be intercepted; see SKILL.md).")
+    def _cert_hint(self, exc):
+        msg = f"HTTPS certificate verification failed for {self.host}: {tls.explain(exc, self._trust)}"
+        if not self.is_official:
+            msg += (" This is common for proxies addressed by a bare IP. To run anyway, set FMP_TLS_VERIFY=0 "
+                    "(traffic can then be intercepted; see SKILL.md).")
+        return self._redact(msg)
 
     def describe(self):
         route = "official FMP API" if self.is_official else f"third-party proxy at {self.host}"
         return {
             "route": route, "base": self.base, "prefix": self.prefix, "auth_style": self.auth_style,
             "source": self.connection_source, "tls_verify": self.tls_verify,
+            "tls_trust": self._trust.description if self._trust else None,
         }
 
     # ------------------------------------------------------------------ low level
@@ -382,7 +388,7 @@ class FMPClient:
                 status, body = self._http_get(url)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 if _is_cert_error(e):
-                    raise FMPError(self._cert_hint())
+                    raise FMPError(self._cert_hint(e))
                 no_response += 1
                 if no_response >= NETWORK_ATTEMPTS:
                     self.unreachable = self._redact(self._unreachable_hint(e))
@@ -521,7 +527,7 @@ def _cmd_check(symbol):
     print(f"  base URL    : {c['base']}")
     print(f"  path prefix : /{c['prefix'] or ''}")
     print(f"  auth style  : {c['auth_style']}  ({c['source']})")
-    print(f"  TLS verify  : {'on' if c['tls_verify'] else 'OFF'}")
+    print(f"  TLS verify  : {'on, trusting ' + c['tls_trust'] if c['tls_verify'] else 'OFF'}")
     print(f"  cache       : {client.cache_dir}")
     today = client._now_ny().date()
     start = (today - timedelta(days=30)).isoformat()

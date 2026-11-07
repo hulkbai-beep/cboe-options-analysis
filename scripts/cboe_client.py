@@ -4,7 +4,9 @@ Client for CBOE's free delayed-quotes feed (plan 4.2) with the cache rules of pl
 
 - get_chain("NVDA" | "_SPX" | "BRK.B") -> the parsed JSON of the whole option chain (every expiry and strike).
 - get_index_history("VIX") -> [{"date": date, "close": float}, ...] oldest first, from CBOE's volatility-index CSVs.
-- Standard library only (urllib), like fmp_client.py. No key is needed.
+- urllib, like fmp_client.py; no key is needed. HTTPS certificates are checked as tls.py describes: the operating
+  system's certificate store through truststore, then certifi's root list and SSL_CERT_FILE. A failed check raises
+  CboeUnreachable with the reason, the certificate the network presented and what was trusted (no retry).
 - Every request sends Accept-Encoding: gzip and is decompressed by hand: urllib does not do it, and CBOE's
   403 "AccessDenied" body for an unknown symbol is gzip too. That 403 raises NotFound (no retry).
 - A 403 without AccessDenied (a Cloudflare or proxy block), 429, 5xx and network errors are tried
@@ -23,8 +25,9 @@ Cache ($OA_CACHE_DIR, default ~/.cache/cboe-options; file names hold only the sy
 - refresh=True skips reading the cache (except the GTH rule above) but still writes it.
 
 CLI:
-  python cboe_client.py check [SYMBOL]   final URL and redirect, HTTP status, compression, sizes, timestamp,
-                                         Last-Modified, cf-cache-status, contracts, expirations (default SPY)
+  python cboe_client.py check [SYMBOL]   certificates trusted, final URL and redirect, HTTP status, compression,
+                                         sizes, timestamp, Last-Modified, cf-cache-status, contracts, expirations
+                                         (default SPY)
   python cboe_client.py clear-cache      delete the cached responses
 """
 from __future__ import annotations
@@ -51,6 +54,7 @@ from pathlib import Path
 
 import config as C
 import chain as CH
+import tls
 
 SOURCE = "CBOE delayed quotes"
 _SYMBOL = re.compile(r"^[A-Z0-9_.]{1,12}$")
@@ -197,13 +201,17 @@ def chain_session_facts(payload: dict) -> dict:
 
 class CboeClient:
     def __init__(self, cache_dir=None, use_cache=True, refresh=False, min_interval=C.CBOE_MIN_INTERVAL,
-                 timeout=C.CBOE_TIMEOUT, urlopen=None, sleep=time.sleep, now=None):
+                 timeout=C.CBOE_TIMEOUT, urlopen=None, sleep=time.sleep, now=None, read_certificate=None):
         self.cache_dir = Path(cache_dir) if cache_dir else default_cache_dir()
         self.use_cache = bool(use_cache)
         self.refresh = bool(refresh)
         self.min_interval = float(min_interval or 0.0)
         self.timeout = timeout
-        self._urlopen = urlopen or urllib.request.urlopen
+        self._urlopen = urlopen or self._open
+        # what the network presents after a failed certificate check (for the message); off for injected transports
+        self._read_certificate = read_certificate or (tls.presented_certificate if urlopen is None else None)
+        self._trust = None
+        self._opener = None
         self._sleep = sleep
         self._now_arg = now
         self.stats = {"network_calls": 0, "cache_hits": 0}
@@ -306,6 +314,13 @@ class CboeClient:
         return {"source": SOURCE, "base": C.CBOE_BASE, "redirected_to": self.redirected_to,
                 "calls": self.stats["network_calls"]}
 
+    @property
+    def trust(self) -> tls.Trust:
+        """The HTTPS context of this client and what it trusts (built on first use)."""
+        if self._trust is None:
+            self._trust = tls.trust()
+        return self._trust
+
     def clear_cache(self) -> list[str]:
         """Delete this client's cached responses; returns what was removed."""
         import shutil
@@ -378,6 +393,22 @@ class CboeClient:
             pass
 
     # ------------------------------------------------------------------ HTTP
+    def _open(self, req, timeout=None):
+        """urlopen with this client's certificate checks (and urllib's proxy settings)."""
+        if self._opener is None:
+            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.trust.context))
+        return self._opener.open(req, timeout=timeout)
+
+    def _cert_failure(self, url: str, exc) -> str:
+        cert = None
+        if self._read_certificate is not None:
+            try:
+                cert = self._read_certificate(url, min(float(self.timeout or 15), 15.0))
+            except Exception:                              # a diagnostic must never replace the real error
+                cert = None
+        return (f"CBOE unreachable: TLS certificate verification failed for {_host(url)}: "
+                f"{tls.explain(exc, self.trust, cert)}")
+
     def _throttle(self) -> None:
         if self.min_interval <= 0:
             return
@@ -425,8 +456,7 @@ class CboeClient:
                 raise CboeError(f"HTTP {e.code} from {_host(final)}") from None
             except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
                 if _is_cert_error(e):
-                    self._down = (f"CBOE unreachable: TLS certificate verification failed for {_host(url)} "
-                                  "(behind a corporate proxy? point SSL_CERT_FILE at its CA bundle)")
+                    self._down = self._cert_failure(url, e)
                     raise CboeUnreachable(self._down) from None
                 self._no_response += 1
                 last = _net_reason(e)
@@ -543,6 +573,10 @@ def check(symbol: str = "SPY") -> int:
     sym = info["cboe"]
     url = C.CBOE_CHAIN_URL.format(symbol=sym)
     print(f"CBOE delayed quotes check: {sym}")
+    trust = client.trust
+    print(f"  certificates    {trust.description}"
+          + (f" ({' and '.join(trust.missing)} not installed: python -m pip install -r requirements.txt)"
+             if trust.missing else ""))
     print(f"  request         {url}")
     try:
         try:

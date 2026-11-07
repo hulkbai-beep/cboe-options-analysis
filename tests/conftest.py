@@ -40,6 +40,7 @@ def no_network(monkeypatch):
     def refuse(*a, **k):
         raise AssertionError("network access in a test")
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)      # CboeClient's own opener
     return refuse
 
 
